@@ -1,0 +1,34 @@
+[package]
+name = "arp-channel"
+version = "0.1.0"
+authors = ["Andrew Whitehead <cywolf@gmail.com>"]
+edition = "2018"
+
+description = "Channels used by async resource pool"
+license = "MIT/Apache-2.0"
+
+[lib]
+name = "arp_channel"
+path = "src/lib.rs"
+
+[features]
+default = ["sink"]
+sink = ["futures-util/sink"]
+
+[dependencies]
+futures-util = "0.3"
+thiserror = "1.0.9"
+
+[dev-dependencies]
+concurrent-queue = "1.1"  # temp for bench only
+criterion = "0.3"
+futures-channel = "0.3"  # temp for bench only
+futures-executor = "0.3"
+
+[[bench]]
+name = "mpsc"
+harness = false
+
+[[bench]]
+name = "option_lock"
+harness = false
