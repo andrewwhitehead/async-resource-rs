@@ -1,14 +1,25 @@
-/// Slightly cheaper version of futures::oneshot
-/// In this case we only need a sync sender and an async receiver,
-/// and the result is simply dropped if it can't be sent.
 use super::option_lock::OptionLock;
+use std::cell::UnsafeCell;
 use std::future::Future;
+use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU8, Ordering},
     Arc,
 };
 use std::task::{Context, Poll, Waker};
+use std::thread;
+
+/// Alternative version of futures::oneshot
+/// In this case poll_cancelled is not available. It could be added
+/// at the expense of another waker per message. This could also be used
+/// to confirm delivery of a message and pull it back out on failure.
+
+const INIT: u8 = 0;
+const LOAD: u8 = 1;
+const READY: u8 = 2;
+const SENT: u8 = 3;
+const CANCEL: u8 = 4;
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Inner::new());
@@ -20,68 +31,126 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 }
 
 pub struct Inner<T> {
-    complete: AtomicBool,
-    data: OptionLock<T>,
-    waker: OptionLock<Waker>,
+    data: UnsafeCell<MaybeUninit<T>>,
+    rx_waker: OptionLock<Waker>,
+    state: AtomicU8,
 }
 
 impl<T> Inner<T> {
     pub fn new() -> Self {
         Self {
-            complete: AtomicBool::new(false),
-            data: OptionLock::new(None),
-            waker: OptionLock::new(None),
+            data: UnsafeCell::new(MaybeUninit::uninit()),
+            rx_waker: OptionLock::new(None),
+            state: AtomicU8::new(INIT),
         }
     }
 
-    pub fn finalize(&self, wake: bool) {
-        if !self.complete.swap(true, Ordering::SeqCst) {
-            if let Some(waker) = self.waker.try_take() {
-                if wake {
-                    waker.wake();
-                }
+    pub fn cancel_rx(&self) {
+        self.state.store(CANCEL, Ordering::Release)
+    }
+
+    pub fn cancel_tx(&self) {
+        if self.state.compare_and_swap(INIT, CANCEL, Ordering::AcqRel) == INIT {
+            if let Some(waker) = self.rx_waker.try_take() {
+                waker.wake();
             }
         }
     }
 
     pub fn recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        let done = if self.complete.load(Ordering::SeqCst) {
-            true
-        } else {
-            // if the acquire fails, it's because the sender is already being dropped
-            // can safely be ignored
-            let waker = cx.waker().clone();
-            match self.waker.try_lock() {
-                Some(mut guard) => {
-                    guard.replace(waker);
-                    false
+        loop {
+            match self
+                .state
+                .compare_exchange_weak(READY, SENT, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    self.state.store(SENT, Ordering::Release);
+                    return Poll::Ready(Some(unsafe { self.data.get().read().assume_init() }));
                 }
-                None => true,
+                Err(INIT) => {
+                    let waker = cx.waker().clone();
+                    match self.rx_waker.try_lock() {
+                        Some(mut guard) => {
+                            guard.replace(waker);
+                        }
+                        None => {
+                            // the sender is already trying to wake us
+                            continue;
+                        }
+                    }
+                    // check the state one more time, in case the sender
+                    // failed to get a lock on the waker because we were storing it
+                    match self.state.load(Ordering::Acquire) {
+                        CANCEL => {
+                            // sender dropped
+                            println!("sender dropped 1");
+                            return Poll::Ready(None);
+                        }
+                        LOAD => {
+                            // sender is currently setting the value, spin
+                            thread::yield_now();
+                            continue;
+                        }
+                        READY => {
+                            // already completed
+                            continue;
+                        }
+                        _ => return Poll::Pending,
+                    }
+                }
+                Err(CANCEL) => {
+                    // sender dropped
+                    println!("sender dropped");
+                    return Poll::Ready(None);
+                }
+                Err(LOAD) => {
+                    // sender is currently setting the value, spin
+                    thread::yield_now();
+                    continue;
+                }
+                Err(READY) => {
+                    // spurious failure
+                    continue;
+                }
+                Err(SENT) => {
+                    // repeated call to receive
+                    println!("already received?");
+                    return Poll::Ready(None);
+                }
+                Err(_) => {
+                    panic!("Invalid state for dropshot");
+                }
             }
-        };
-
-        // check if complete was set while the waker was locked
-        if done || self.complete.load(Ordering::SeqCst) {
-            // this acquire should never fail because complete is not set until
-            // the other side has been dropped. in that rare occurrance, treat it
-            // as a failed send
-            Poll::Ready(self.data.try_take())
-        } else {
-            Poll::Pending
         }
     }
 
-    pub fn send(&self, data: T) -> Option<T> {
-        if !self.complete.load(Ordering::Acquire) {
-            // this acquire should never fail, but we don't mind if it does
-            if let Some(mut guard) = self.data.try_lock() {
-                if guard.is_none() {
-                    guard.replace(data);
+    pub fn send(&self, value: T) -> Option<T> {
+        loop {
+            match self
+                .state
+                .compare_exchange_weak(INIT, LOAD, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    unsafe { self.data.get().write(MaybeUninit::new(value)) };
+                    self.state.store(READY, Ordering::Release);
+                    if let Some(waker) = self.rx_waker.try_take() {
+                        waker.wake();
+                    }
                     return None;
+                }
+                Err(INIT) => {
+                    // spurious failure
+                    continue;
+                }
+                Err(CANCEL) | Err(LOAD) | Err(READY) | Err(SENT) => {
+                    // receiver hung up, or send was called repeatedly
+                    return Some(value);
+                }
+                Err(_) => {
+                    panic!("Invalid state for dropshot");
                 }
             }
         }
-        return Some(data);
     }
 }
 
@@ -99,7 +168,7 @@ impl<T> Future for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.inner.finalize(false)
+        self.inner.cancel_rx()
     }
 }
 
@@ -115,7 +184,7 @@ impl<T> Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.inner.finalize(true)
+        self.inner.cancel_tx()
     }
 }
 
@@ -148,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn send_normal() {
+    fn dropshot_send_normal() {
         let (sender, mut receiver) = channel();
         let waker = Arc::new(TestWaker::new());
         let wr = waker_ref(&waker);
@@ -156,30 +225,32 @@ mod tests {
         assert_eq!(Pin::new(&mut receiver).poll(&mut cx), Poll::Pending);
         assert_eq!(waker.count(), 0);
         assert_eq!(sender.send(1u32), None);
-        assert_eq!(Pin::new(&mut receiver).poll(&mut cx), Poll::Pending);
-        assert_eq!(waker.count(), 0);
-        drop(sender);
+        assert_eq!(waker.count(), 1);
         assert_eq!(
             Pin::new(&mut receiver).poll(&mut cx),
             Poll::Ready(Some(1u32))
         );
+        drop(sender);
+        assert_eq!(waker.count(), 1);
+        assert_eq!(Pin::new(&mut receiver).poll(&mut cx), Poll::Ready(None));
         assert_eq!(waker.count(), 1);
     }
 
     #[test]
-    fn sender_dropped() {
+    fn dropshot_sender_dropped() {
         let (sender, mut receiver) = channel::<u32>();
         let waker = Arc::new(TestWaker::new());
         let wr = waker_ref(&waker);
         let mut cx = Context::from_waker(&wr);
         assert_eq!(Pin::new(&mut receiver).poll(&mut cx), Poll::Pending);
         drop(sender);
+        assert_eq!(waker.count(), 1);
         assert_eq!(Pin::new(&mut receiver).poll(&mut cx), Poll::Ready(None));
         assert_eq!(waker.count(), 1);
     }
 
     #[test]
-    fn receiver_dropped() {
+    fn dropshot_receiver_dropped() {
         let (sender, receiver) = channel();
         drop(receiver);
         assert_eq!(sender.send(1u32), Some(1u32));
