@@ -15,7 +15,7 @@ use std::thread;
 use futures_util::sink::Sink;
 use futures_util::stream::Stream;
 
-use super::drain::Drain;
+use super::drain::{BlockingDrain, Drain};
 use super::OptionLock;
 
 // Each block covers one "lap" of indices.
@@ -173,22 +173,22 @@ impl<T> Receiver<T> {
         self.queue.close_rx()
     }
 
-    pub fn iter(&mut self) -> Drain<T> {
-        Drain::new(self.queue.clone(), true)
+    pub fn iter(&mut self) -> BlockingDrain<T> {
+        BlockingDrain::new(self.queue.clone())
     }
 
     pub fn try_iter(&mut self) -> Drain<T> {
-        Drain::new(self.queue.clone(), false)
+        Drain::new(self.queue.clone())
     }
 
-    pub fn try_recv(&self) -> Option<T> {
+    pub fn try_recv(&self) -> Result<Option<T>, bool> {
         self.queue.pop()
     }
 }
 
 impl<T> IntoIterator for Receiver<T> {
     type Item = T;
-    type IntoIter = Drain<T>;
+    type IntoIter = BlockingDrain<T>;
 
     fn into_iter(mut self) -> Self::IntoIter {
         self.iter()
@@ -204,7 +204,7 @@ impl<T> Drop for Receiver<T> {
 impl<T> Stream for Receiver<T> {
     type Item = T;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        match self.queue.pop_wake(Some(cx.waker())) {
+        match self.queue.pop_wake(cx.waker()) {
             Ok(result @ Some(..)) => Poll::Ready(result),
             Ok(None) => Poll::Pending,
             Err(_) => Poll::Ready(None),
@@ -313,7 +313,7 @@ impl<T> Queue<T> {
     }
 
     // not thread safe
-    pub fn pop(&self) -> Option<T> {
+    pub fn _pop(&self) -> Option<T> {
         unsafe {
             let mut next = *self.read.get();
             let offset = (next.index >> SHIFT) % LAP;
@@ -338,18 +338,29 @@ impl<T> Queue<T> {
         }
     }
 
-    pub fn pop_wake(&self, waker: Option<&Waker>) -> Result<Option<T>, bool> {
+    pub fn pop(&self) -> Result<Option<T>, bool> {
+        match self._pop() {
+            found @ Some(..) => Ok(found),
+            _ => {
+                if self.tx_closed() {
+                    Err(false)
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    pub fn pop_wake(&self, waker: &Waker) -> Result<Option<T>, bool> {
         loop {
-            match self.pop() {
+            match self._pop() {
                 found @ Some(_) => return Ok(found),
                 None => {
-                    if let Some(waker) = waker {
-                        if let Some(mut guard) = self.waker.try_lock() {
-                            guard.replace(waker.clone());
-                        } else {
-                            // a sender is trying to wake us already
-                            continue;
-                        }
+                    if let Some(mut guard) = self.waker.try_lock() {
+                        guard.replace(waker.clone());
+                    } else {
+                        // a sender is trying to wake us already
+                        continue;
                     }
                     if !self.is_empty() {
                         // we are slow to register the waker, so this checks if

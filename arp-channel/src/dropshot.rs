@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 
 use super::option_lock::OptionLock;
-use super::waker::UnparkWaker;
+use super::thread_waker::thread_waker;
 
 /// Alternative version of futures::oneshot
 /// In this case poll_cancelled is not available. It could be added
@@ -203,13 +203,6 @@ impl<T> Inner<T> {
     fn take(&self) -> T {
         unsafe { self.data.get().read().assume_init() }
     }
-
-    pub fn state(&self) -> (u8, bool) {
-        (
-            self.state.load(Ordering::Acquire),
-            self.recv_waker.try_take().is_some(),
-        )
-    }
 }
 
 pub struct Receiver<T> {
@@ -231,21 +224,14 @@ impl<T> Receiver<T> {
                 Err(err) => return Err(err),
             }
         }
-        let waker = UnparkWaker::new();
         loop {
-            match self.inner.poll_recv(&mut waker.context()) {
+            let (waiter, waker) = thread_waker();
+            match self.inner.poll_recv(&mut waker.to_context()) {
                 Poll::Ready(result) => return result,
                 Poll::Pending => {
-                    // println!("park!");
-                    let ts = std::time::Instant::now();
-                    thread::park_timeout(std::time::Duration::from_millis(500));
-                    if std::time::Instant::now() - ts > std::time::Duration::from_millis(100) {
-                        println!("{:?}", self.inner.state());
-                        return Err(Canceled);
-                    }
+                    waiter.wait();
                 }
             }
-            //println!("unpark!");
         }
     }
 
