@@ -157,7 +157,7 @@ impl<T> Inner<T> {
         }
     }
 
-    pub fn send(&self, value: T) -> Option<T> {
+    pub fn send(&self, value: T) -> Result<(), T> {
         loop {
             match self
                 .state
@@ -175,11 +175,11 @@ impl<T> Inner<T> {
                             if let Some(waker) = self.recv_waker.try_take() {
                                 waker.wake();
                             }
-                            return None;
+                            return Ok(());
                         }
                         Err(CANCEL) => {
                             // receiver dropped mid-send
-                            return Some(self.take());
+                            return Err(self.take());
                         }
                         _ => panic!("Invalid state for dropshot"),
                     }
@@ -190,7 +190,7 @@ impl<T> Inner<T> {
                 }
                 Err(CANCEL) | Err(LOAD) | Err(READY) | Err(SENT) => {
                     // receiver hung up, or send was called repeatedly
-                    return Some(value);
+                    return Err(value);
                 }
                 Err(_) => {
                     panic!("Invalid state for dropshot");
@@ -259,14 +259,14 @@ pub struct Sender<T> {
 }
 
 impl<T> Sender<T> {
-    pub fn send(&self, data: T) -> Option<T> {
+    pub fn send(&self, data: T) -> Result<(), T> {
         self.inner.send(data)
     }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.inner.cancel_send()
+        self.inner.cancel_send();
     }
 }
 
@@ -306,7 +306,7 @@ mod tests {
         let mut cx = Context::from_waker(&wr);
         assert_eq!(Pin::new(&mut receiver).poll(&mut cx), Poll::Pending);
         assert_eq!(waker.count(), 0);
-        assert_eq!(sender.send(1u32), None);
+        assert!(sender.send(1u32).is_ok());
         assert_eq!(waker.count(), 1);
         assert_eq!(Pin::new(&mut receiver).poll(&mut cx), Poll::Ready(Ok(1u32)));
         drop(sender);
@@ -338,14 +338,14 @@ mod tests {
     fn dropshot_receiver_dropped() {
         let (sender, receiver) = channel();
         drop(receiver);
-        assert_eq!(sender.send(1u32), Some(1u32));
+        assert_eq!(sender.send(1u32), Err(1u32));
     }
 
     #[test]
     fn dropshot_test_future() {
         use futures_executor::block_on;
         let (sender, receiver) = channel::<u32>();
-        sender.send(5);
+        sender.send(5).unwrap();
         assert_eq!(block_on(receiver), Ok(5));
     }
 }

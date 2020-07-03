@@ -31,7 +31,7 @@ fn dropshot_telephone(threads: usize) {
         let (next_send, next_receive) = channel();
         thread::spawn(move || loop {
             if let Ok(Some(result)) = receiver.try_recv() {
-                next_send.send(result);
+                next_send.send(result).unwrap();
                 break;
             }
             thread::yield_now();
@@ -39,7 +39,7 @@ fn dropshot_telephone(threads: usize) {
         receiver = next_receive;
     }
     let testval = 1001u32;
-    sender.send(testval);
+    sender.send(testval).unwrap();
     assert_eq!(block_on(receiver), Ok(testval));
 }
 
@@ -49,12 +49,12 @@ fn dropshot_telephone_block(threads: usize) {
         let (next_send, next_receive) = channel();
         thread::spawn(move || {
             let result = receiver.recv().ok().unwrap_or(0);
-            next_send.send(result);
+            next_send.send(result).unwrap();
         });
         receiver = next_receive;
     }
     let testval = 1001u32;
-    sender.send(testval);
+    sender.send(testval).unwrap();
     assert_eq!(receiver.recv(), Ok(testval));
 }
 

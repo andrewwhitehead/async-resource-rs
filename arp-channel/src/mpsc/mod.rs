@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::fmt;
 use std::iter::IntoIterator;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -15,8 +16,10 @@ use std::thread;
 use futures_util::sink::Sink;
 use futures_util::stream::Stream;
 
-use super::drain::{BlockingDrain, Drain};
 use super::OptionLock;
+
+mod drain;
+use drain::{Drain, TryDrain};
 
 // Each block covers one "lap" of indices.
 const LAP: usize = 32;
@@ -28,6 +31,17 @@ const SHIFT: usize = 1;
 // * If set in head, indicates that the block is not the last one.
 // * If set in tail, indicates that the queue is closed.
 const MARK_BIT: usize = 1;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Disconnected;
+
+impl fmt::Display for Disconnected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "dropshot canceled")
+    }
+}
+
+impl std::error::Error for Disconnected {}
 
 /// A slot in a block.
 struct Slot<T> {
@@ -125,8 +139,13 @@ impl<T> Sender<T> {
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        self.queue.inc_senders();
-        Self::new(self.queue.clone())
+        if !self.closed {
+            self.queue.inc_senders();
+        }
+        Self {
+            closed: self.closed,
+            queue: self.queue.clone(),
+        }
     }
 }
 
@@ -173,22 +192,22 @@ impl<T> Receiver<T> {
         self.queue.close_rx()
     }
 
-    pub fn iter(&mut self) -> BlockingDrain<T> {
-        BlockingDrain::new(self.queue.clone())
-    }
-
-    pub fn try_iter(&mut self) -> Drain<T> {
+    pub fn iter(&mut self) -> Drain<T> {
         Drain::new(self.queue.clone())
     }
 
-    pub fn try_recv(&self) -> Result<Option<T>, bool> {
+    pub fn try_iter(&mut self) -> TryDrain<T> {
+        TryDrain::new(self.queue.clone())
+    }
+
+    pub fn try_recv(&self) -> Result<Option<T>, Disconnected> {
         self.queue.pop()
     }
 }
 
 impl<T> IntoIterator for Receiver<T> {
     type Item = T;
-    type IntoIter = BlockingDrain<T>;
+    type IntoIter = Drain<T>;
 
     fn into_iter(mut self) -> Self::IntoIter {
         self.iter()
@@ -276,7 +295,7 @@ impl<T> Queue<T> {
                 next_block.replace(Box::new(Block::<T>::new()));
             }
 
-            let new_tail = tail + (1 << SHIFT);
+            let new_tail = tail.wrapping_add(1 << SHIFT);
 
             // Try advancing the tail forward.
             match self.write.index.compare_exchange_weak(
@@ -328,22 +347,22 @@ impl<T> Queue<T> {
                 let destroy = next.block;
                 next.block = (*next.block).next.load(Ordering::Acquire);
                 drop(Box::from_raw(destroy));
-                next.index += 1 << SHIFT;
+                next.index = next.index.wrapping_add(1 << SHIFT);
             }
 
-            next.index += 1 << SHIFT;
+            next.index = next.index.wrapping_add(1 << SHIFT);
             *self.read.get() = next;
 
             Some(value)
         }
     }
 
-    pub fn pop(&self) -> Result<Option<T>, bool> {
+    pub fn pop(&self) -> Result<Option<T>, Disconnected> {
         match self._pop() {
             found @ Some(..) => Ok(found),
             _ => {
                 if self.tx_closed() {
-                    Err(false)
+                    Err(Disconnected)
                 } else {
                     Ok(None)
                 }
@@ -351,7 +370,7 @@ impl<T> Queue<T> {
         }
     }
 
-    pub fn pop_wake(&self, waker: &Waker) -> Result<Option<T>, bool> {
+    pub fn pop_wake(&self, waker: &Waker) -> Result<Option<T>, Disconnected> {
         loop {
             match self._pop() {
                 found @ Some(_) => return Ok(found),
@@ -368,7 +387,7 @@ impl<T> Queue<T> {
                         // a write was started after pop()
                         self.wake_rx();
                     } else if self.tx_closed() {
-                        return Err(false);
+                        return Err(Disconnected);
                     }
                     return Ok(None);
                 }
