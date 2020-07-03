@@ -26,6 +26,10 @@ futures-channel = "0.3"  # temp for bench only
 futures-executor = "0.3"
 
 [[bench]]
+name = "dropshot"
+harness = false
+
+[[bench]]
 name = "mpsc"
 harness = false
 

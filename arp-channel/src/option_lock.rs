@@ -68,7 +68,7 @@ impl<'a, T> Drop for Guard<'a, T> {
     fn drop(&mut self) {
         self.lock
             .state
-            .store(if self.is_some() { SOME } else { NONE }, Ordering::Release);
+            .swap(if self.is_some() { SOME } else { NONE }, Ordering::AcqRel);
     }
 }
 
