@@ -3,4 +3,4 @@ pub mod mpsc;
 pub mod thread_waker;
 
 mod option_lock;
-pub use option_lock::OptionLock;
+pub use option_lock::{OptionGuard, OptionLock};

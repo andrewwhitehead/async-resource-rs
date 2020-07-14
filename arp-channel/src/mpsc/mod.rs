@@ -6,7 +6,7 @@ use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::ptr;
 use std::sync::{
-    atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    atomic::{self, AtomicPtr, AtomicUsize, Ordering},
     Arc,
 };
 use std::task::{Context, Poll, Waker};
@@ -20,6 +20,14 @@ use super::OptionLock;
 
 mod drain;
 use drain::{Drain, TryDrain};
+
+// Bits indicating the state of a slot:
+// * If a value has been written into the slot, `WRITE` is set.
+// * If a value has been read from the slot, `READ` is set.
+// * If the block is being destroyed, `DESTROY` is set.
+const WRITE: usize = 1;
+const READ: usize = 2;
+const DESTROY: usize = 4;
 
 // Each block covers one "lap" of indices.
 const LAP: usize = 32;
@@ -49,14 +57,21 @@ struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 
     /// The state of the slot.
-    written: AtomicBool,
+    state: AtomicUsize,
 }
 
 impl<T> Slot<T> {
     const UNINIT: Slot<T> = Slot {
         value: UnsafeCell::new(MaybeUninit::uninit()),
-        written: AtomicBool::new(false),
+        state: AtomicUsize::new(0),
     };
+
+    /// Waits until a value is written into the slot.
+    fn wait_write(&self) {
+        while self.state.load(Ordering::Acquire) & WRITE == 0 {
+            thread::yield_now();
+        }
+    }
 }
 
 /// A block in a linked list.
@@ -76,6 +91,17 @@ impl<T> Block<T> {
         Block {
             next: AtomicPtr::new(ptr::null_mut()),
             slots: [Slot::UNINIT; BLOCK_CAP],
+        }
+    }
+
+    /// Waits until the next pointer is set.
+    fn wait_next(&self) -> *mut Block<T> {
+        loop {
+            let next = self.next.load(Ordering::Acquire);
+            if !next.is_null() {
+                return next;
+            }
+            thread::yield_now();
         }
     }
 }
@@ -100,12 +126,20 @@ impl<T> Clone for ReadPosition<T> {
 impl<T> Copy for ReadPosition<T> {}
 
 /// A position in a queue.
-struct WritePosition<T> {
+struct Position<T> {
     /// The block in the linked list.
     block: AtomicPtr<Block<T>>,
 
     /// The index in the queue.
     index: AtomicUsize,
+}
+
+impl<T> Position<T> {
+    pub fn load(&self, ordering: Ordering) -> (*mut Block<T>, usize) {
+        let block = self.block.load(ordering);
+        let index = self.index.load(ordering);
+        (block, index)
+    }
 }
 
 pub struct Sender<T> {
@@ -200,7 +234,7 @@ impl<T> Receiver<T> {
         TryDrain::new(self.queue.clone())
     }
 
-    pub fn try_recv(&self) -> Result<Option<T>, Disconnected> {
+    pub fn try_recv(&mut self) -> Result<Option<T>, Disconnected> {
         self.queue.pop()
     }
 }
@@ -237,9 +271,9 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
 }
 
 pub struct Queue<T> {
-    read: UnsafeCell<ReadPosition<T>>,
+    head: Position<T>,
 
-    write: WritePosition<T>,
+    tail: Position<T>,
 
     senders: AtomicUsize,
 
@@ -251,14 +285,13 @@ pub struct Queue<T> {
 
 impl<T> Queue<T> {
     pub(crate) fn new() -> Self {
-        let init = Box::into_raw(Box::new(Block::<T>::new()));
         Self {
-            read: UnsafeCell::new(ReadPosition {
-                block: init,
-                index: 0,
-            }),
-            write: WritePosition {
-                block: AtomicPtr::new(init),
+            head: Position {
+                block: AtomicPtr::new(ptr::null_mut()),
+                index: AtomicUsize::new(0),
+            },
+            tail: Position {
+                block: AtomicPtr::new(ptr::null_mut()),
                 index: AtomicUsize::new(0),
             },
             senders: AtomicUsize::new(1),
@@ -268,12 +301,12 @@ impl<T> Queue<T> {
     }
 
     pub fn push(&self, value: T) -> Option<T> {
-        let mut tail = self.write.index.load(Ordering::Acquire);
-        let mut block = self.write.block.load(Ordering::Acquire);
+        let mut tail = self.tail.index.load(Ordering::Acquire);
+        let mut block = self.tail.block.load(Ordering::Acquire);
         let mut next_block = None;
 
         loop {
-            // Check if receiver has been dropped
+            // Check if the queue is closed.
             if tail & MARK_BIT != 0 {
                 return Some(value);
             }
@@ -284,21 +317,42 @@ impl<T> Queue<T> {
             // If we reached the end of the block, wait until the next one is installed.
             if offset == BLOCK_CAP {
                 thread::yield_now();
-                tail = self.write.index.load(Ordering::Acquire);
-                block = self.write.block.load(Ordering::Acquire);
+                tail = self.tail.index.load(Ordering::Acquire);
+                block = self.tail.block.load(Ordering::Acquire);
                 continue;
             }
 
             // If we're going to have to install the next block, allocate it in advance in order to
             // make the wait for other threads as short as possible.
             if offset + 1 == BLOCK_CAP && next_block.is_none() {
-                next_block.replace(Box::new(Block::<T>::new()));
+                next_block = Some(Box::new(Block::<T>::new()));
             }
 
-            let new_tail = tail.wrapping_add(1 << SHIFT);
+            // If this is the first value to be pushed into the queue, we need to allocate the
+            // first block and install it.
+            if block.is_null() {
+                let new = Box::into_raw(Box::new(Block::<T>::new()));
+
+                if self
+                    .tail
+                    .block
+                    .compare_and_swap(block, new, Ordering::Release)
+                    == block
+                {
+                    self.head.block.store(new, Ordering::Release);
+                    block = new;
+                } else {
+                    next_block = unsafe { Some(Box::from_raw(new)) };
+                    tail = self.tail.index.load(Ordering::Acquire);
+                    block = self.tail.block.load(Ordering::Acquire);
+                    continue;
+                }
+            }
+
+            let new_tail = tail + (1 << SHIFT);
 
             // Try advancing the tail forward.
-            match self.write.index.compare_exchange_weak(
+            match self.tail.index.compare_exchange_weak(
                 tail,
                 new_tail,
                 Ordering::SeqCst,
@@ -308,52 +362,109 @@ impl<T> Queue<T> {
                     // If we've reached the end of the block, install the next one.
                     if offset + 1 == BLOCK_CAP {
                         let next_block = Box::into_raw(next_block.unwrap());
-                        self.write.block.store(next_block, Ordering::Release);
-                        self.write.index.fetch_add(1 << SHIFT, Ordering::Release);
+                        self.tail.block.store(next_block, Ordering::Release);
+                        self.tail.index.fetch_add(1 << SHIFT, Ordering::Release);
                         (*block).next.store(next_block, Ordering::Release);
                     }
 
                     // Write the value into the slot.
                     let slot = (*block).slots.get_unchecked(offset);
                     slot.value.get().write(MaybeUninit::new(value));
-                    slot.written.store(true, Ordering::Release);
-
-                    // Alert the receiver if waiting
-                    self.wake_rx();
-
+                    slot.state.fetch_or(WRITE, Ordering::Release);
                     return None;
                 },
                 Err(t) => {
                     tail = t;
-                    block = self.write.block.load(Ordering::Acquire);
+                    block = self.tail.block.load(Ordering::Acquire);
                 }
             }
         }
     }
 
-    // not thread safe
     pub fn _pop(&self) -> Option<T> {
-        unsafe {
-            let mut next = *self.read.get();
-            let offset = (next.index >> SHIFT) % LAP;
+        let acquire = Ordering::Relaxed;
+        let release = Ordering::Relaxed;
+        let (mut block, mut head) = self.head.load(acquire);
 
-            let slot = (*next.block).slots.get_unchecked(offset);
-            if !slot.written.load(Ordering::Acquire) {
-                return None;
+        loop {
+            // Calculate the offset of the index into the block.
+            let offset = (head >> SHIFT) % LAP;
+
+            // If we reached the end of the block, wait until the next one is installed.
+            if offset == BLOCK_CAP {
+                thread::yield_now();
+                let (b, h) = self.head.load(acquire);
+                block = b;
+                head = h;
+                continue;
             }
-            let value = slot.value.get().read().assume_init();
 
-            if offset == BLOCK_CAP - 1 {
-                let destroy = next.block;
-                next.block = (*next.block).next.load(Ordering::Acquire);
-                drop(Box::from_raw(destroy));
-                next.index = next.index.wrapping_add(1 << SHIFT);
+            let mut new_head = head + (1 << SHIFT);
+
+            if new_head & MARK_BIT == 0 {
+                atomic::fence(Ordering::SeqCst);
+                let tail = self.tail.index.load(Ordering::Relaxed);
+
+                // If the tail equals the head, that means the queue is empty.
+                if head >> SHIFT == tail >> SHIFT {
+                    return None;
+                }
+
+                // If head and tail are not in the same block, set `MARK_BIT` in head.
+                if (head >> SHIFT) / LAP != (tail >> SHIFT) / LAP {
+                    new_head |= MARK_BIT;
+                }
             }
 
-            next.index = next.index.wrapping_add(1 << SHIFT);
-            *self.read.get() = next;
+            // Try moving the head index forward.
+            match self.head.index.compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => unsafe {
+                    // If we've reached the end of the block, move to the next one.
+                    if offset + 1 == BLOCK_CAP {
+                        let next = (*block).wait_next();
+                        let mut next_index = (new_head & !MARK_BIT).wrapping_add(1 << SHIFT);
+                        if !(*next).next.load(Ordering::Relaxed).is_null() {
+                            next_index |= MARK_BIT;
+                        }
 
-            Some(value)
+                        self.head.block.store(next, Ordering::Relaxed);
+                        self.head.index.store(next_index, Ordering::Relaxed);
+                    }
+
+                    // Read the value.
+                    let slot = (*block).slots.get_unchecked(offset);
+                    slot.wait_write();
+                    let value = slot.value.get().read().assume_init();
+
+                    // Destroy the block if we've reached the end, or if another thread wanted to
+                    // destroy but couldn't because we were busy reading from the slot.
+                    // if offset + 1 == BLOCK_CAP {
+                    //     Block::destroy(block, 0);
+                    // } else if slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0 {
+                    //     Block::destroy(block, offset + 1);
+                    // }
+                    if offset + 1 == BLOCK_CAP {
+                        // let destroy = next.block;
+                        // next.block = (*next.block).next.load(Ordering::Acquire);
+                        drop(Box::from_raw(block));
+                    // next.index = next.index.wrapping_add(1 << SHIFT);
+                    } else if slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0 {
+                        drop(Box::from_raw(block));
+                        //Block::destroy(block, offset + 1);
+                    }
+
+                    return Some(value);
+                },
+                Err(h) => {
+                    head = h;
+                    block = self.head.block.load(acquire);
+                }
+            }
         }
     }
 
@@ -399,7 +510,7 @@ impl<T> Queue<T> {
     ///
     /// Returns `true` if this call closed the queue.
     pub fn close_rx(&self) -> bool {
-        let tail = self.write.index.fetch_or(MARK_BIT, Ordering::SeqCst);
+        let tail = self.tail.index.fetch_or(MARK_BIT, Ordering::SeqCst);
 
         if tail & MARK_BIT == 0 {
             true
@@ -410,7 +521,7 @@ impl<T> Queue<T> {
 
     /// Returns `true` if the queue is closed.
     pub fn rx_closed(&self) -> bool {
-        self.write.index.load(Ordering::SeqCst) & MARK_BIT != 0
+        self.tail.index.load(Ordering::SeqCst) & MARK_BIT != 0
     }
 
     pub fn inc_senders(&self) {
@@ -427,10 +538,9 @@ impl<T> Queue<T> {
         self.senders.load(Ordering::Acquire) == 0
     }
 
-    // not thread safe
     pub fn is_empty(&self) -> bool {
-        let head = unsafe { (*self.read.get()).index };
-        let tail = self.write.index.load(Ordering::SeqCst);
+        let head = self.head.index.load(Ordering::SeqCst);
+        let tail = self.tail.index.load(Ordering::SeqCst);
         head >> SHIFT == tail >> SHIFT
     }
 
@@ -443,20 +553,17 @@ impl<T> Queue<T> {
 
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
-        let ReadPosition {
-            mut index,
-            mut block,
-        } = unsafe { *self.read.get() };
-        let mut tail = self.write.index.load(Ordering::Relaxed);
+        let (mut block, mut head) = self.head.load(Ordering::Relaxed);
+        let mut tail = self.tail.index.load(Ordering::Relaxed);
 
         // Erase the lower bits.
-        index &= !((1 << SHIFT) - 1);
+        head &= !((1 << SHIFT) - 1);
         tail &= !((1 << SHIFT) - 1);
 
         unsafe {
             // Drop all values between `head` and `tail` and deallocate the heap-allocated blocks.
-            while index != tail {
-                let offset = (index >> SHIFT) % LAP;
+            while head != tail {
+                let offset = (head >> SHIFT) % LAP;
 
                 if offset < BLOCK_CAP {
                     // Drop the value in the slot.
@@ -470,7 +577,7 @@ impl<T> Drop for Queue<T> {
                     block = next;
                 }
 
-                index = index.wrapping_add(1 << SHIFT);
+                head = head.wrapping_add(1 << SHIFT);
             }
 
             // Deallocate the last remaining block.

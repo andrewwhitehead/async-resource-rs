@@ -28,10 +28,14 @@ impl<T> OptionLock<T> {
         self.data.into_inner()
     }
 
-    pub fn try_lock(&self) -> Option<Guard<'_, T>> {
+    pub fn is_locked(&self) -> bool {
+        self.state.load(Ordering::Acquire) == HELD
+    }
+
+    pub fn try_lock(&self) -> Option<OptionGuard<'_, T>> {
         match self.state.swap(HELD, Ordering::AcqRel) {
             HELD => None,
-            _ => Some(Guard { lock: self }),
+            _ => Some(OptionGuard { lock: self }),
         }
     }
 
@@ -47,24 +51,24 @@ impl<T> OptionLock<T> {
     }
 }
 
-pub struct Guard<'a, T> {
+pub struct OptionGuard<'a, T> {
     lock: &'a OptionLock<T>,
 }
 
-impl<T> Deref for Guard<'_, T> {
+impl<T> Deref for OptionGuard<'_, T> {
     type Target = Option<T>;
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.lock.data.get() }
     }
 }
 
-impl<T> DerefMut for Guard<'_, T> {
+impl<T> DerefMut for OptionGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.lock.data.get() }
     }
 }
 
-impl<'a, T> Drop for Guard<'a, T> {
+impl<'a, T> Drop for OptionGuard<'a, T> {
     fn drop(&mut self) {
         self.lock
             .state
