@@ -1,0 +1,26 @@
+[package]
+name = "arp"
+version = "0.1.0"
+authors = ["Andrew Whitehead <cywolf@gmail.com>"]
+edition = "2018"
+
+description = "Async resource pool"
+license = "MIT/Apache-2.0"
+
+[lib]
+name = "arp"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+arp-channel = { path = "../arp-channel" }
+concurrent-queue = "1.1"
+futures-util = "0.3"
+thiserror = "1.0.9"
+
+[dev-dependencies]
+criterion = "0.3"
+futures-channel = "0.3"  # temp for bench only
+futures-executor = "0.3"
