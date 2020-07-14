@@ -28,7 +28,7 @@ impl<T, E> Acquire<T, E> {
 }
 
 impl<T, E> Future for Acquire<T, E> {
-    type Output = Result<Managed<T, E>, AcquireError<E>>;
+    type Output = Result<Managed<T>, AcquireError<E>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = match self.state.take() {
@@ -45,7 +45,7 @@ impl<T, E> Future for Acquire<T, E> {
                     // Try to acquire from the idle queue
                     if let Some(guard) = self.pool.inner.try_acquire_idle() {
                         // FIXME make ready
-                        let mng = Managed::new(guard, self.pool.clone());
+                        let mng = Managed::new(guard, self.pool.state().clone());
                         return Poll::Ready(Ok(mng));
                     }
 
@@ -64,7 +64,7 @@ impl<T, E> Future for Acquire<T, E> {
                     }
                     Poll::Ready(res) => {
                         let res = res
-                            .map(|guard| Managed::new(guard, self.pool.clone()))
+                            .map(|guard| Managed::new(guard, self.pool.state().clone()))
                             .map_err(AcquireError::ResourceError);
                         return Poll::Ready(res);
                     }

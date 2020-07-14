@@ -9,26 +9,14 @@ use super::acquire::Acquire;
 
 use super::resource::{Lifecycle, ResourceFuture, ResourceGuard, ResourceInfo, ResourceLock};
 
-pub(crate) struct Inner<T, E> {
+pub(crate) struct PoolState<T> {
     count: AtomicUsize,
     idle_queue: ConcurrentQueue<ResourceLock<T>>,
-    lifecycle: Lifecycle<T, E>,
     max_count: Option<usize>,
     repo: Mutex<Vec<ResourceLock<T>>>,
-    // wait_queue: ConcurrentQueue<Waiter>,
 }
 
-impl<T, E> Inner<T, E> {
-    pub fn new(lifecycle: Lifecycle<T, E>, max_count: Option<usize>) -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-            idle_queue: ConcurrentQueue::unbounded(),
-            lifecycle,
-            max_count,
-            repo: Mutex::new(Vec::new()),
-        }
-    }
-
+impl<T> PoolState<T> {
     pub fn try_acquire_idle(&self) -> Option<ResourceGuard<T>> {
         while let Ok(res) = self.idle_queue.pop() {
             // FIXME limit the number of attempts to avoid blocking async?
@@ -46,9 +34,38 @@ impl<T, E> Inner<T, E> {
         None
     }
 
+    pub fn release(&self, res: ResourceGuard<T>) {
+        // The queue is never closed or full, so this should not fail.
+        // If it does then the resource is simply dropped.
+        self.idle_queue.push(res.unlock()).unwrap_or(());
+    }
+}
+
+pub(crate) struct Inner<T, E> {
+    state: Arc<PoolState<T>>,
+    lifecycle: Lifecycle<T, E>,
+    // wait_queue: ConcurrentQueue<Waiter>,
+}
+
+impl<T, E> Inner<T, E> {
+    pub fn new(lifecycle: Lifecycle<T, E>, max_count: Option<usize>) -> Self {
+        let state = Arc::new(PoolState {
+            count: AtomicUsize::new(0),
+            idle_queue: ConcurrentQueue::unbounded(),
+            max_count,
+            repo: Mutex::new(Vec::new()),
+        });
+        Self { lifecycle, state }
+    }
+
+    pub fn try_acquire_idle(&self) -> Option<ResourceGuard<T>> {
+        self.state.try_acquire_idle()
+    }
+
     pub fn try_create(&self) -> Option<ResourceFuture<T, E>> {
-        let mut count = self.count.load(Ordering::Acquire);
+        let mut count = self.state.count.load(Ordering::Acquire);
         if !self
+            .state
             .max_count
             .clone()
             .map(|max| max > count)
@@ -61,9 +78,9 @@ impl<T, E> Inner<T, E> {
         let lock = ResourceLock::new(ResourceInfo::default(), None);
         let guard = lock.try_lock().unwrap();
 
-        if let Ok(mut repo) = self.repo.try_lock() {
+        if let Ok(mut repo) = self.state.repo.try_lock() {
             loop {
-                match self.count.compare_exchange_weak(
+                match self.state.count.compare_exchange_weak(
                     count,
                     count + 1,
                     Ordering::SeqCst,
@@ -76,7 +93,14 @@ impl<T, E> Inner<T, E> {
                         break Some(fut);
                     }
                     Err(c) => {
-                        if c > count && !self.max_count.clone().map(|max| max > c).unwrap_or(true) {
+                        if c > count
+                            && !self
+                                .state
+                                .max_count
+                                .clone()
+                                .map(|max| max > c)
+                                .unwrap_or(true)
+                        {
                             // Count was increased beyond max by another thread
                             break None;
                         }
@@ -88,12 +112,6 @@ impl<T, E> Inner<T, E> {
         } else {
             None
         }
-    }
-
-    pub fn release(&self, res: ResourceGuard<T>) {
-        // The queue is never closed or full, so this should not fail.
-        // If it does then the resource is simply dropped.
-        self.idle_queue.push(res.unlock()).unwrap_or(());
     }
 }
 
@@ -110,6 +128,10 @@ impl<T, E> Pool<T, E> {
 
     pub fn acquire(&self) -> Acquire<T, E> {
         Acquire::new(self.clone())
+    }
+
+    pub(crate) fn state(&self) -> &Arc<PoolState<T>> {
+        &self.inner.state
     }
 }
 
