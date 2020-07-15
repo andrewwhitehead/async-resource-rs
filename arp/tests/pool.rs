@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_executor::block_on;
 
@@ -17,8 +18,8 @@ fn counter_pool() -> PoolConfig<usize, ()> {
 }
 
 #[test]
-fn test_pool_acquire_order() {
-    let pool = counter_pool().build();
+fn test_pool_acquire_order_timeout() {
+    let pool = counter_pool().idle_timeout(Duration::from_secs(1)).build();
     let next = || pool.acquire();
     block_on(async move {
         let mut fst = next().await.unwrap();
@@ -31,6 +32,24 @@ fn test_pool_acquire_order() {
         drop(fst);
         fst = next().await.unwrap();
         assert_eq!(*fst, 1);
+    })
+}
+
+#[test]
+fn test_pool_acquire_order_no_timeout() {
+    let pool = counter_pool().build();
+    let next = || pool.acquire();
+    block_on(async move {
+        let fst = next().await.unwrap();
+        let snd = next().await.unwrap();
+        assert_eq!(*fst, 1);
+        assert_eq!(*snd, 2);
+        drop(snd);
+        let trd = next().await.unwrap();
+        assert_eq!(*trd, 3);
+        drop(fst);
+        let fth = next().await.unwrap();
+        assert_eq!(*fth, 4);
     })
 }
 

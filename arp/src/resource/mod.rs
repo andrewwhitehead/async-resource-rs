@@ -18,9 +18,7 @@ pub struct ResourceInfo {
     pub borrow_count: usize,
     pub last_borrow: Option<Instant>,
     pub last_idle: Option<Instant>,
-    pub last_verified: Option<Instant>,
-    pub disposed_at: Option<Instant>,
-    pub borrowed: bool,
+    pub verify_at: Option<Instant>,
 }
 
 impl Default for ResourceInfo {
@@ -31,9 +29,7 @@ impl Default for ResourceInfo {
             borrow_count: 0,
             last_borrow: None,
             last_idle: None,
-            last_verified: None,
-            disposed_at: None,
-            borrowed: false,
+            verify_at: None,
         }
     }
 }

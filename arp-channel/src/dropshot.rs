@@ -68,12 +68,19 @@ impl<T> Inner<T> {
         }
     }
 
-    pub fn cancel_send(&self) {
+    pub fn cancel_send(&self) -> bool {
         if self.state.compare_and_swap(INIT, CANCEL, Ordering::SeqCst) == INIT {
             if let Some(waker) = self.recv_waker.try_take() {
                 waker.wake();
             }
+            true
+        } else {
+            false
         }
+    }
+
+    pub fn is_canceled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == CANCEL
     }
 
     pub fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<T, Canceled>> {
@@ -210,7 +217,7 @@ pub struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
-    pub fn close(&mut self) -> Option<T> {
+    pub fn cancel(&mut self) -> Option<T> {
         self.inner.cancel_recv()
     }
 
@@ -259,6 +266,14 @@ pub struct Sender<T> {
 }
 
 impl<T> Sender<T> {
+    pub fn cancel(&self) -> bool {
+        self.inner.cancel_send()
+    }
+
+    pub fn is_canceled(&self) -> bool {
+        self.inner.is_canceled()
+    }
+
     pub fn send(&self, data: T) -> Result<(), T> {
         self.inner.send(data)
     }

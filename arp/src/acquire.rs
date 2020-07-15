@@ -45,7 +45,7 @@ impl<T, E> Future for Acquire<T, E> {
                     // Try to acquire from the idle queue
                     if let Some(guard) = self.pool.inner.try_acquire_idle() {
                         // FIXME make ready
-                        let mng = Managed::new(guard, self.pool.state().clone());
+                        let mng = Managed::new(guard, self.pool.queue().clone());
                         return Poll::Ready(Ok(mng));
                     }
 
@@ -64,7 +64,7 @@ impl<T, E> Future for Acquire<T, E> {
                     }
                     Poll::Ready(res) => {
                         let res = res
-                            .map(|guard| Managed::new(guard, self.pool.state().clone()))
+                            .map(|guard| Managed::new(guard, self.pool.queue().clone()))
                             .map_err(AcquireError::ResourceError);
                         return Poll::Ready(res);
                     }
@@ -78,5 +78,15 @@ impl<T, E> Future for Acquire<T, E> {
                    // }
             };
         }
+    }
+}
+
+impl<T, E> Drop for Acquire<T, E> {
+    fn drop(&mut self) {
+        // FIXME in Waiting state, try to close receiver
+        // return value to pool otherwise
+
+        // in Resolve state, return future to executor
+        // pool.exec(fut)
     }
 }

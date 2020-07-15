@@ -76,6 +76,19 @@ impl<T, E> PoolConfig<T, E> {
         self
     }
 
+    pub fn keepalive<K, F>(mut self, keepalive: K) -> Self
+    where
+        K: Fn(T, ResourceInfo) -> F + Send + Sync + 'static,
+        F: TryFuture<Ok = Option<T>, Error = E> + Send + 'static,
+        T: Send + 'static,
+        E: 'static,
+    {
+        self.lifecycle
+            .keepalive
+            .replace(Box::new(resource_update(keepalive)));
+        self
+    }
+
     pub fn max_count(mut self, val: usize) -> Self {
         if val > 0 {
             self.max_count.replace(val);
@@ -105,7 +118,14 @@ impl<T, E> PoolConfig<T, E> {
     }
 
     pub fn build(self) -> Pool<T, E> {
-        let inner = PoolInner::new(self.lifecycle, self.max_count.clone());
+        let inner = PoolInner::new(
+            self.lifecycle,
+            self.acquire_timeout,
+            self.idle_timeout,
+            self.min_count,
+            self.max_count,
+            self.max_waiters,
+        );
         Pool::new(inner)
         // let exec = Executor::new(self.thread_count.unwrap_or(1));
         // Pool::new(queue, mgr, exec)

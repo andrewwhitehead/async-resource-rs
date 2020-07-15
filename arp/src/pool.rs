@@ -1,71 +1,157 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
-};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::{atomic::Ordering, Arc};
+use std::time::{Duration, Instant};
 
 use concurrent_queue::ConcurrentQueue;
 
 use super::acquire::Acquire;
-
+use super::queue::{Queue, QueueEvent};
 use super::resource::{Lifecycle, ResourceFuture, ResourceGuard, ResourceInfo, ResourceLock};
+use super::wait::WaitResponder;
+use super::waker::QueueWaiter;
 
-pub(crate) struct PoolState<T> {
-    count: AtomicUsize,
-    idle_queue: ConcurrentQueue<ResourceLock<T>>,
-    max_count: Option<usize>,
-    repo: Mutex<Vec<ResourceLock<T>>>,
-}
-
-impl<T> PoolState<T> {
-    pub fn try_acquire_idle(&self) -> Option<ResourceGuard<T>> {
-        while let Ok(res) = self.idle_queue.pop() {
-            // FIXME limit the number of attempts to avoid blocking async?
-            if let Some(guard) = res.try_lock() {
-                if guard.is_some() {
-                    return Some(guard);
-                } else {
-                    // Drop the entry - it was taken by the manager thread.
-                }
-            } else {
-                // Drop the entry - currently locked by manager thread
-                // and will be disposed or recreated as a new entry.
-            }
-        }
-        None
-    }
-
-    pub fn release(&self, res: ResourceGuard<T>) {
-        // The queue is never closed or full, so this should not fail.
-        // If it does then the resource is simply dropped.
-        self.idle_queue.push(res.unlock()).unwrap_or(());
-    }
+pub(crate) struct PoolManageState<T, E> {
+    acquire_timeout: Option<Duration>,
+    lifecycle: Lifecycle<T, E>,
+    max_waiters: Option<usize>,
+    queue_waiter: QueueWaiter,
+    wait_inject: ConcurrentQueue<(Instant, WaitResponder<T>)>,
 }
 
 pub(crate) struct Inner<T, E> {
-    state: Arc<PoolState<T>>,
-    lifecycle: Lifecycle<T, E>,
-    // wait_queue: ConcurrentQueue<Waiter>,
+    manage: PoolManageState<T, E>,
+    queue: Arc<Queue<T>>,
 }
 
 impl<T, E> Inner<T, E> {
-    pub fn new(lifecycle: Lifecycle<T, E>, max_count: Option<usize>) -> Self {
-        let state = Arc::new(PoolState {
-            count: AtomicUsize::new(0),
-            idle_queue: ConcurrentQueue::unbounded(),
-            max_count,
-            repo: Mutex::new(Vec::new()),
-        });
-        Self { lifecycle, state }
+    pub fn new(
+        lifecycle: Lifecycle<T, E>,
+        acquire_timeout: Option<Duration>,
+        idle_timeout: Option<Duration>,
+        min_count: usize,
+        max_count: Option<usize>,
+        max_waiters: Option<usize>,
+    ) -> Self {
+        let (queue, queue_waiter) = Queue::new(idle_timeout, max_count, min_count);
+        let manage = PoolManageState {
+            acquire_timeout,
+            lifecycle,
+            max_waiters,
+            queue_waiter,
+            wait_inject: ConcurrentQueue::unbounded(),
+        };
+        Self {
+            manage,
+            queue: Arc::new(queue),
+        }
+    }
+
+    fn manage(self: Arc<Self>) {
+        let mut timer_id_source: usize = 0;
+        let mut timers = BTreeMap::<(Instant, usize), Timer<T>>::new();
+        let mut next_check = None;
+        let mut repo = HashSet::<ResourceLock<T>>::new();
+        let mut waiters = VecDeque::<WaitResponder<T>>::new();
+
+        loop {
+            let remain_timers = timers.split_off(&(Instant::now(), 0));
+            for ((inst, _), timer) in timers {
+                match timer {
+                    Timer::Verify(res) => {
+                        if let Some(mut guard) = res.try_lock() {
+                            // The clone of the resource lock in the idle queue can't be
+                            // acquired at the moment, so forget that lock and create a
+                            // new one.
+                            repo.remove(&guard.as_lock());
+                            guard = guard.detach();
+
+                            if guard.info().verify_at == Some(inst) {
+                                // Act upon the verify timer
+                                let op = if self.queue.count.load(Ordering::Acquire)
+                                    > self.queue.min_count
+                                {
+                                    self.manage.lifecycle.dispose(guard)
+                                } else {
+                                    self.manage.lifecycle.keepalive(guard)
+                                };
+                            // FIXME Give the future to the executor
+                            } else {
+                                // The resource was reacquired and released after the
+                                // verify timer was set.
+                                repo.insert(guard.as_lock());
+                                self.queue.release(guard);
+                            }
+                        } else {
+                            // If the resource is locked, then a consumer thread
+                            // has acquired it or is in the process of doing so,
+                            // nothing to do here.
+                        }
+                    }
+                    Timer::Waiter(waiter) => {
+                        // Try to cancel the waiter. This will only succeed if the
+                        // waiter hasn't been fulfilled already, or cancelled by the
+                        // other side.
+                        waiter.cancel();
+                    }
+                }
+            }
+            timers = remain_timers;
+
+            if let Some(fst) = timers.keys().next() {
+                next_check = Some(next_check.map_or(fst.0, |t| std::cmp::min(t, fst.0)))
+            }
+
+            // Set the waiter state to Idle. If anything is subsequently added, it will move to Busy.
+            self.manage.queue_waiter.prepare_wait();
+
+            while let Ok(event) = self.queue.event_queue.pop() {
+                match event {
+                    QueueEvent::Created(res) => {
+                        repo.insert(res);
+                    }
+                    // QueueEvent::Disposed(res) => {
+                    //     repo.remove(&res);
+                    // }
+                    QueueEvent::Verify(expire, res) => {
+                        timer_id_source += 1;
+                        timers.insert((expire, timer_id_source), Timer::Verify(res));
+                    }
+                }
+            }
+
+            while let Ok((start, waiter)) = self.manage.wait_inject.pop() {
+                if let Some(expire) = self.manage.acquire_timeout.clone().map(|dur| start + dur) {
+                    timer_id_source += 1;
+                    timers.insert((expire, timer_id_source), Timer::Waiter(waiter.clone()));
+                }
+                waiters.push_back(waiter);
+            }
+
+            if waiters.is_empty() {
+                self.queue
+                    .busy
+                    .compare_and_swap(true, false, Ordering::Release);
+            }
+
+            // FIXME fulfill waiters
+
+            if let Some(next_check) = next_check {
+                self.manage.queue_waiter.wait_until(next_check);
+            } else {
+                self.manage.queue_waiter.wait();
+            }
+            next_check = None;
+        }
     }
 
     pub fn try_acquire_idle(&self) -> Option<ResourceGuard<T>> {
-        self.state.try_acquire_idle()
+        self.queue.try_acquire_idle()
     }
 
     pub fn try_create(&self) -> Option<ResourceFuture<T, E>> {
-        let mut count = self.state.count.load(Ordering::Acquire);
+        let mut count = self.queue.count.load(Ordering::Acquire);
         if !self
-            .state
+            .queue
             .max_count
             .clone()
             .map(|max| max > count)
@@ -78,41 +164,44 @@ impl<T, E> Inner<T, E> {
         let lock = ResourceLock::new(ResourceInfo::default(), None);
         let guard = lock.try_lock().unwrap();
 
-        if let Ok(mut repo) = self.state.repo.try_lock() {
-            loop {
-                match self.state.count.compare_exchange_weak(
-                    count,
-                    count + 1,
-                    Ordering::SeqCst,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        repo.push(guard.as_lock());
-                        drop(repo);
-                        let fut = self.lifecycle.create(guard);
-                        break Some(fut);
+        loop {
+            match self.queue.count.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // FIXME repo not required if there is no resource expiry?
+                    self.queue
+                        .event_queue
+                        .push(QueueEvent::Created(guard.as_lock()));
+                    let fut = self.manage.lifecycle.create(guard);
+                    break Some(fut);
+                }
+                Err(c) => {
+                    if c > count
+                        && !self
+                            .queue
+                            .max_count
+                            .clone()
+                            .map(|max| max > c)
+                            .unwrap_or(true)
+                    {
+                        // Count was increased beyond max by another thread
+                        break None;
                     }
-                    Err(c) => {
-                        if c > count
-                            && !self
-                                .state
-                                .max_count
-                                .clone()
-                                .map(|max| max > c)
-                                .unwrap_or(true)
-                        {
-                            // Count was increased beyond max by another thread
-                            break None;
-                        }
-                        count = c;
-                        continue;
-                    }
+                    count = c;
+                    continue;
                 }
             }
-        } else {
-            None
         }
     }
+}
+
+enum Timer<T> {
+    Verify(ResourceLock<T>),
+    Waiter(WaitResponder<T>),
 }
 
 pub struct Pool<T, E> {
@@ -130,8 +219,8 @@ impl<T, E> Pool<T, E> {
         Acquire::new(self.clone())
     }
 
-    pub(crate) fn state(&self) -> &Arc<PoolState<T>> {
-        &self.inner.state
+    pub(crate) fn queue(&self) -> &Arc<Queue<T>> {
+        &self.inner.queue
     }
 }
 
@@ -142,3 +231,5 @@ impl<T, E> Clone for Pool<T, E> {
         }
     }
 }
+
+// FIXME test behaviour of cloned WaitResponder + close

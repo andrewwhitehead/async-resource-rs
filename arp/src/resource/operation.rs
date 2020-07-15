@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use futures_util::future::{BoxFuture, FutureExt, TryFuture, TryFutureExt};
 
 use super::lock::ResourceGuard;
@@ -35,6 +37,7 @@ where
             result
                 .and_then(|res| async move {
                     guard.replace(res);
+                    guard.info().created_at.replace(Instant::now());
                     Ok(guard)
                 })
                 .boxed()
@@ -54,7 +57,9 @@ where
             let result = update(res, *guard.info());
             result
                 .and_then(|optres| async move {
-                    optres.and_then(|res| guard.replace(res));
+                    if let Some(res) = optres {
+                        guard.replace(res);
+                    }
                     Ok(guard)
                 })
                 .boxed()

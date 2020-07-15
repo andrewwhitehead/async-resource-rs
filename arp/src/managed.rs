@@ -2,19 +2,19 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use super::pool::PoolState;
+use super::queue::Queue;
 use super::resource::ResourceGuard;
 
 pub struct Managed<T> {
     value: Option<ResourceGuard<T>>,
-    pool: Option<Arc<PoolState<T>>>,
+    queue: Option<Arc<Queue<T>>>,
 }
 
 impl<T> Managed<T> {
-    pub(crate) fn new(value: ResourceGuard<T>, pool: Arc<PoolState<T>>) -> Self {
+    pub(crate) fn new(value: ResourceGuard<T>, queue: Arc<Queue<T>>) -> Self {
         Self {
             value: Some(value),
-            pool: Some(pool),
+            queue: Some(queue),
         }
     }
 }
@@ -55,8 +55,8 @@ impl<T> DerefMut for Managed<T> {
 
 impl<T> Drop for Managed<T> {
     fn drop(&mut self) {
-        if let Some(pool) = self.pool.take() {
-            pool.release(self.value.take().unwrap());
+        if let Some(queue) = self.queue.take() {
+            queue.release(self.value.take().unwrap());
         }
     }
 }

@@ -12,6 +12,12 @@ pub struct OptionLock<T> {
     state: AtomicU8,
 }
 
+impl<T> Default for OptionLock<T> {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
 unsafe impl<T: Send> Send for OptionLock<T> {}
 unsafe impl<T: Send> Sync for OptionLock<T> {}
 
