@@ -113,10 +113,6 @@ pub struct ResourceGuard<T> {
 }
 
 impl<T> ResourceGuard<T> {
-    pub fn info(&mut self) -> &mut ResourceInfo {
-        unsafe { &mut (*self.lock.data.get()).0 }
-    }
-
     pub fn as_lock(&self) -> ResourceLock<T> {
         ResourceLock {
             inner: self.lock.clone(),
@@ -128,6 +124,10 @@ impl<T> ResourceGuard<T> {
         Self {
             lock: Arc::new(inner),
         }
+    }
+
+    pub fn info(&mut self) -> &mut ResourceInfo {
+        unsafe { &mut (*self.lock.data.get()).0 }
     }
 
     pub fn unlock(self) -> ResourceLock<T> {

@@ -29,6 +29,8 @@ struct Inner {
     thread: UnsafeCell<MaybeUninit<thread::Thread>>,
 }
 
+unsafe impl Sync for Inner {}
+
 pub struct QueueWaker {
     inner: Arc<Inner>,
 }

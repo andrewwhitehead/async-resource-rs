@@ -1,14 +1,17 @@
-use super::lock::ResourceGuard;
-use super::operation::{ResourceFuture, ResourceOperation};
+use std::sync::Arc;
 
-pub struct Lifecycle<T, E> {
+use super::lock::ResourceGuard;
+use super::operation::{ResourceOperation, ResourceResolve};
+use crate::pool::PoolInner;
+
+pub struct Lifecycle<T: Send, E> {
     pub create: Box<dyn ResourceOperation<T, E> + Send + Sync>,
     pub dispose: Option<Box<dyn ResourceOperation<T, E> + Send + Sync>>,
     pub handle_error: Option<Box<dyn Fn(E) + Send + Sync>>,
     pub keepalive: Option<Box<dyn ResourceOperation<T, E> + Send + Sync>>,
 }
 
-impl<T, E> Lifecycle<T, E> {
+impl<T: Send, E> Lifecycle<T, E> {
     pub fn new(create: Box<dyn ResourceOperation<T, E> + Send + Sync>) -> Self {
         Self {
             create,
@@ -18,16 +21,24 @@ impl<T, E> Lifecycle<T, E> {
         }
     }
 
-    pub fn create(&self, target: ResourceGuard<T>) -> ResourceFuture<T, E> {
-        self.create.apply(target)
+    pub fn create(
+        &self,
+        guard: ResourceGuard<T>,
+        pool: &Arc<PoolInner<T, E>>,
+    ) -> ResourceResolve<T, E> {
+        self.create.apply(guard, pool)
     }
 
-    pub fn keepalive(&self, target: ResourceGuard<T>) -> Option<ResourceFuture<T, E>> {
+    pub fn keepalive(
+        &self,
+        guard: ResourceGuard<T>,
+        pool: &Arc<PoolInner<T, E>>,
+    ) -> ResourceResolve<T, E> {
         println!("keepalive");
         if let Some(handler) = self.keepalive.as_ref() {
-            Some(handler.apply(target))
+            handler.apply(guard, pool)
         } else {
-            self.dispose(target)
+            self.dispose(guard, pool)
         }
     }
 
@@ -45,12 +56,16 @@ impl<T, E> Lifecycle<T, E> {
     //     fut
     // }
 
-    pub fn dispose(&self, target: ResourceGuard<T>) -> Option<ResourceFuture<T, E>> {
+    pub fn dispose(
+        &self,
+        guard: ResourceGuard<T>,
+        pool: &Arc<PoolInner<T, E>>,
+    ) -> ResourceResolve<T, E> {
         println!("dispose");
         if let Some(handler) = self.dispose.as_ref() {
-            Some(handler.apply(target))
+            handler.apply(guard, pool)
         } else {
-            None
+            ResourceResolve::empty()
         }
     }
 }

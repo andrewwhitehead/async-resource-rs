@@ -16,8 +16,10 @@ default = []
 
 [dependencies]
 arp-channel = { path = "../arp-channel" }
+async-channel = "1.1"
 concurrent-queue = "1.1"
 futures-util = "0.3"
+smol = "0.1.18"
 thiserror = "1.0.9"
 
 [dev-dependencies]

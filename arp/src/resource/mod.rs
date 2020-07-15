@@ -6,6 +6,7 @@ pub use lock::{ResourceGuard, ResourceLock};
 mod operation;
 pub use operation::{
     resource_create, resource_dispose, resource_update, ResourceFuture, ResourceOperation,
+    ResourceResolve,
 };
 
 mod lifecycle;

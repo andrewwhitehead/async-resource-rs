@@ -2,12 +2,12 @@ use std::time::Duration;
 
 use futures_util::future::TryFuture;
 
-use super::pool::{Inner as PoolInner, Pool};
+use super::pool::{Pool, PoolInner};
 use super::resource::{
     resource_create, resource_dispose, resource_update, Lifecycle, ResourceInfo,
 };
 
-pub struct PoolConfig<T, E> {
+pub struct PoolConfig<T: Send, E> {
     acquire_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     min_count: usize,
@@ -17,7 +17,7 @@ pub struct PoolConfig<T, E> {
     lifecycle: Lifecycle<T, E>,
 }
 
-impl<T, E> PoolConfig<T, E> {
+impl<T: Send, E> PoolConfig<T, E> {
     pub fn new<C, F>(create: C) -> Self
     where
         C: Fn() -> F + Send + Sync + 'static,
@@ -125,6 +125,7 @@ impl<T, E> PoolConfig<T, E> {
             self.min_count,
             self.max_count,
             self.max_waiters,
+            self.thread_count,
         );
         Pool::new(inner)
         // let exec = Executor::new(self.thread_count.unwrap_or(1));

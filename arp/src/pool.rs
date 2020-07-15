@@ -1,29 +1,42 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use concurrent_queue::ConcurrentQueue;
 
+use futures_util::FutureExt;
+
 use super::acquire::Acquire;
+use super::executor::Executor;
 use super::queue::{Queue, QueueEvent};
-use super::resource::{Lifecycle, ResourceFuture, ResourceGuard, ResourceInfo, ResourceLock};
+use super::resource::{Lifecycle, ResourceFuture, ResourceInfo, ResourceLock, ResourceResolve};
 use super::wait::WaitResponder;
 use super::waker::QueueWaiter;
 
-pub(crate) struct PoolManageState<T, E> {
+const INIT: u8 = 0;
+const ACTIVE: u8 = 1;
+const SHUTDOWN: u8 = 2;
+const STOPPED: u8 = 3;
+
+pub(crate) struct PoolManageState<T: Send + 'static, E: 'static> {
     acquire_timeout: Option<Duration>,
+    executor: Executor,
     lifecycle: Lifecycle<T, E>,
     max_waiters: Option<usize>,
     queue_waiter: QueueWaiter,
-    wait_inject: ConcurrentQueue<(Instant, WaitResponder<T>)>,
+    state: AtomicU8,
+    wait_inject: ConcurrentQueue<(Instant, WaitResponder<T, E>)>,
 }
 
-pub(crate) struct Inner<T, E> {
+pub struct PoolInner<T: Send + 'static, E: 'static> {
     manage: PoolManageState<T, E>,
     queue: Arc<Queue<T>>,
 }
 
-impl<T, E> Inner<T, E> {
+impl<T: Send, E> PoolInner<T, E> {
     pub fn new(
         lifecycle: Lifecycle<T, E>,
         acquire_timeout: Option<Duration>,
@@ -31,13 +44,17 @@ impl<T, E> Inner<T, E> {
         min_count: usize,
         max_count: Option<usize>,
         max_waiters: Option<usize>,
+        thread_count: Option<usize>,
     ) -> Self {
-        let (queue, queue_waiter) = Queue::new(idle_timeout, max_count, min_count);
+        let executor = Executor::new(thread_count.unwrap_or(1));
+        let (queue, queue_waiter) = Queue::new(min_count, max_count, idle_timeout);
         let manage = PoolManageState {
             acquire_timeout,
+            executor,
             lifecycle,
             max_waiters,
             queue_waiter,
+            state: AtomicU8::new(INIT),
             wait_inject: ConcurrentQueue::unbounded(),
         };
         Self {
@@ -46,14 +63,27 @@ impl<T, E> Inner<T, E> {
         }
     }
 
+    pub fn handle_error(&self, err: E) {
+        self.manage.lifecycle.handle_error(err);
+    }
+
     fn manage(self: Arc<Self>) {
         let mut timer_id_source: usize = 0;
-        let mut timers = BTreeMap::<(Instant, usize), Timer<T>>::new();
+        let mut timers = BTreeMap::<(Instant, usize), Timer<T, E>>::new();
         let mut next_check = None;
         let mut repo = HashSet::<ResourceLock<T>>::new();
-        let mut waiters = VecDeque::<WaitResponder<T>>::new();
+        let mut waiters = VecDeque::<WaitResponder<T, E>>::new();
 
-        loop {
+        let mut state = match self
+            .manage
+            .state
+            .compare_and_swap(INIT, ACTIVE, Ordering::AcqRel)
+        {
+            INIT => ACTIVE,
+            other => other,
+        };
+
+        while state != STOPPED {
             let remain_timers = timers.split_off(&(Instant::now(), 0));
             for ((inst, _), timer) in timers {
                 match timer {
@@ -65,16 +95,17 @@ impl<T, E> Inner<T, E> {
                             repo.remove(&guard.as_lock());
                             guard = guard.detach();
 
-                            if guard.info().verify_at == Some(inst) {
+                            if guard.is_some() && guard.info().verify_at == Some(inst) {
                                 // Act upon the verify timer
                                 let op = if self.queue.count.load(Ordering::Acquire)
                                     > self.queue.min_count
                                 {
-                                    self.manage.lifecycle.dispose(guard)
+                                    self.manage.lifecycle.dispose(guard, &self)
                                 } else {
-                                    self.manage.lifecycle.keepalive(guard)
+                                    self.manage.lifecycle.keepalive(guard, &self)
                                 };
-                            // FIXME Give the future to the executor
+                                // Just give the future to the executor to complete
+                                drop(op);
                             } else {
                                 // The resource was reacquired and released after the
                                 // verify timer was set.
@@ -101,7 +132,8 @@ impl<T, E> Inner<T, E> {
                 next_check = Some(next_check.map_or(fst.0, |t| std::cmp::min(t, fst.0)))
             }
 
-            // Set the waiter state to Idle. If anything is subsequently added, it will move to Busy.
+            // Set the waiter state to Idle.
+            // If anything is subsequently added to the queues, it will move to Busy.
             self.manage.queue_waiter.prepare_wait();
 
             while let Ok(event) = self.queue.event_queue.pop() {
@@ -109,9 +141,9 @@ impl<T, E> Inner<T, E> {
                     QueueEvent::Created(res) => {
                         repo.insert(res);
                     }
-                    // QueueEvent::Disposed(res) => {
-                    //     repo.remove(&res);
-                    // }
+                    QueueEvent::Disposed(res) => {
+                        repo.remove(&res);
+                    }
                     QueueEvent::Verify(expire, res) => {
                         timer_id_source += 1;
                         timers.insert((expire, timer_id_source), Timer::Verify(res));
@@ -131,9 +163,15 @@ impl<T, E> Inner<T, E> {
                 self.queue
                     .busy
                     .compare_and_swap(true, false, Ordering::Release);
+            } else {
+                while let Some(waiter) = waiters.pop_front() {
+                    if waiter.is_canceled() {
+                        continue;
+                    }
+                    // Bypasses busy check because we are satisfying waiters
+                    if let Some(idle) = self.queue.try_acquire_idle() {}
+                }
             }
-
-            // FIXME fulfill waiters
 
             if let Some(next_check) = next_check {
                 self.manage.queue_waiter.wait_until(next_check);
@@ -144,11 +182,30 @@ impl<T, E> Inner<T, E> {
         }
     }
 
-    pub fn try_acquire_idle(&self) -> Option<ResourceGuard<T>> {
-        self.queue.try_acquire_idle()
+    pub fn release_future(self: &Arc<Self>, fut: ResourceFuture<T, E>) {
+        let inner = self.clone();
+        self.manage.executor.spawn_ok(fut.map(move |res| match res {
+            Ok(res) => {
+                inner.queue.release(res);
+            }
+            Err(err) => {
+                inner.handle_error(err);
+            }
+        }))
     }
 
-    pub fn try_create(&self) -> Option<ResourceFuture<T, E>> {
+    pub fn try_acquire_idle(self: &Arc<Self>) -> ResourceResolve<T, E> {
+        if self.queue.busy.load(Ordering::Acquire) {
+            None.into()
+        } else {
+            self.queue
+                .try_acquire_idle()
+                .map(|res| (res, self.queue.clone()))
+                .into()
+        }
+    }
+
+    pub fn try_create(self: &Arc<Self>) -> ResourceResolve<T, E> {
         let mut count = self.queue.count.load(Ordering::Acquire);
         if !self
             .queue
@@ -157,7 +214,7 @@ impl<T, E> Inner<T, E> {
             .map(|max| max > count)
             .unwrap_or(true)
         {
-            return None;
+            return None.into();
         }
 
         // Allocate up-front to reduce the time spent holding the lock
@@ -173,11 +230,12 @@ impl<T, E> Inner<T, E> {
             ) {
                 Ok(_) => {
                     // FIXME repo not required if there is no resource expiry?
+                    // Not concerned with failure here
                     self.queue
                         .event_queue
-                        .push(QueueEvent::Created(guard.as_lock()));
-                    let fut = self.manage.lifecycle.create(guard);
-                    break Some(fut);
+                        .push(QueueEvent::Created(guard.as_lock()))
+                        .unwrap_or(());
+                    break self.manage.lifecycle.create(guard, self);
                 }
                 Err(c) => {
                     if c > count
@@ -189,7 +247,7 @@ impl<T, E> Inner<T, E> {
                             .unwrap_or(true)
                     {
                         // Count was increased beyond max by another thread
-                        break None;
+                        break None.into();
                     }
                     count = c;
                     continue;
@@ -199,17 +257,17 @@ impl<T, E> Inner<T, E> {
     }
 }
 
-enum Timer<T> {
+enum Timer<T: Send + 'static, E: 'static> {
     Verify(ResourceLock<T>),
-    Waiter(WaitResponder<T>),
+    Waiter(WaitResponder<T, E>),
 }
 
-pub struct Pool<T, E> {
-    pub(crate) inner: Arc<Inner<T, E>>,
+pub struct Pool<T: Send + 'static, E: 'static> {
+    pub(crate) inner: Arc<PoolInner<T, E>>,
 }
 
-impl<T, E> Pool<T, E> {
-    pub(crate) fn new(inner: Inner<T, E>) -> Self {
+impl<T: Send, E> Pool<T, E> {
+    pub(crate) fn new(inner: PoolInner<T, E>) -> Self {
         Self {
             inner: Arc::new(inner),
         }
@@ -224,7 +282,7 @@ impl<T, E> Pool<T, E> {
     }
 }
 
-impl<T, E> Clone for Pool<T, E> {
+impl<T: Send, E> Clone for Pool<T, E> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
