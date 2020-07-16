@@ -1,4 +1,5 @@
 mod pool;
+pub use pool::{Pool, PoolShutdown};
 
 pub mod resource;
 

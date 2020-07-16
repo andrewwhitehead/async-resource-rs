@@ -1,15 +1,24 @@
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use arp_channel::dropshot;
 pub use dropshot::Canceled;
 
-use super::resource::ResourceResolve;
-
-pub struct WaitResponder<T: Send + 'static, E: 'static> {
-    sender: Arc<dropshot::Sender<ResourceResolve<T, E>>>,
+pub fn waiter_pair<T>() -> (WaitResponder<T>, Waiter<T>) {
+    let (sender, receiver) = dropshot::channel();
+    (
+        WaitResponder {
+            sender: Arc::new(sender),
+        },
+        Waiter { receiver },
+    )
 }
 
-impl<T: Send, E> WaitResponder<T, E> {
+pub struct WaitResponder<T> {
+    sender: Arc<dropshot::Sender<T>>,
+}
+
+impl<T> WaitResponder<T> {
     pub fn cancel(&self) -> bool {
         self.sender.cancel()
     }
@@ -18,12 +27,12 @@ impl<T: Send, E> WaitResponder<T, E> {
         self.sender.is_canceled()
     }
 
-    pub fn send(&self, resolve: ResourceResolve<T, E>) -> Result<(), ResourceResolve<T, E>> {
+    pub fn send(&self, resolve: T) -> Result<(), T> {
         self.sender.send(resolve)
     }
 }
 
-impl<T: Send, E> Clone for WaitResponder<T, E> {
+impl<T> Clone for WaitResponder<T> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
@@ -31,16 +40,19 @@ impl<T: Send, E> Clone for WaitResponder<T, E> {
     }
 }
 
-pub struct Waiter<T: Send + 'static, E: 'static> {
-    receiver: dropshot::Receiver<ResourceResolve<T, E>>,
+pub struct Waiter<T> {
+    receiver: dropshot::Receiver<T>,
 }
 
-impl<T: Send, E> Waiter<T, E> {
-    pub fn cancel(&mut self) -> Option<ResourceResolve<T, E>> {
-        self.receiver.cancel()
+impl<T> Deref for Waiter<T> {
+    type Target = dropshot::Receiver<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.receiver
     }
+}
 
-    pub fn try_recv(&mut self) -> Result<Option<ResourceResolve<T, E>>, Canceled> {
-        self.receiver.try_recv()
+impl<T> DerefMut for Waiter<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.receiver
     }
 }

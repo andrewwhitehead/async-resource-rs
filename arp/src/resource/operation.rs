@@ -28,6 +28,18 @@ impl<T: Send, E> ResourceResolve<T, E> {
     pub fn is_empty(&self) -> bool {
         matches!(self.0, ResourceResolveType::Resource(None))
     }
+
+    pub fn is_pending(&self) -> bool {
+        matches!(self.0, ResourceResolveType::Future(..))
+    }
+
+    pub fn take_resource(&mut self) -> Option<ResourceGuard<T>> {
+        if let ResourceResolveType::Resource(ref mut res) = &mut self.0 {
+            res.take().map(|(res, _)| res)
+        } else {
+            None
+        }
+    }
 }
 
 impl<T: Send, E> From<(ResourceGuard<T>, Arc<Queue<T>>)> for ResourceResolve<T, E> {

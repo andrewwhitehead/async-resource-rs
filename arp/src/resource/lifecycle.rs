@@ -34,7 +34,6 @@ impl<T: Send, E> Lifecycle<T, E> {
         guard: ResourceGuard<T>,
         pool: &Arc<PoolInner<T, E>>,
     ) -> ResourceResolve<T, E> {
-        println!("keepalive");
         if let Some(handler) = self.keepalive.as_ref() {
             handler.apply(guard, pool)
         } else {
@@ -61,7 +60,6 @@ impl<T: Send, E> Lifecycle<T, E> {
         guard: ResourceGuard<T>,
         pool: &Arc<PoolInner<T, E>>,
     ) -> ResourceResolve<T, E> {
-        println!("dispose");
         if let Some(handler) = self.dispose.as_ref() {
             handler.apply(guard, pool)
         } else {

@@ -87,13 +87,3 @@ impl<T: Send, E> Future for Acquire<T, E> {
         }
     }
 }
-
-impl<T: Send, E> Drop for Acquire<T, E> {
-    fn drop(&mut self) {
-        // FIXME in Waiting state, try to close receiver
-        // return value to pool otherwise
-
-        // in Resolve state, return future to executor
-        // pool.exec(fut)
-    }
-}

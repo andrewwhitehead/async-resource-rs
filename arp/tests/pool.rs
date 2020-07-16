@@ -69,7 +69,7 @@ fn test_pool_dispose() {
         .build();
     block_on(async move {
         pool.acquire().await.unwrap();
-        //pool.drain().await;
+        pool.shutdown(Duration::from_secs(1)).await;
     });
     assert_eq!(disposed.value(), 1);
 }
