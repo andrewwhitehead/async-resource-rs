@@ -92,7 +92,6 @@ impl<T: Send, E> PoolInner<T, E> {
             // Set the state to Stopped when this thread exits, whether normally
             // or due to a panic.
             inner.manage.state.store(STOPPED, Ordering::Release);
-            println!("shutdown");
         });
         let mut next_check = None;
         let mut repo = HashSet::<ResourceLock<T>>::new();
@@ -106,10 +105,6 @@ impl<T: Send, E> PoolInner<T, E> {
                 match timer {
                     Timer::Shutdown(_) => {
                         // Just drop the shutdown timer to indicate we haven't finished
-                        println!("shutdown expired {}", repo.len());
-                        if let Some(r) = repo.iter().next() {
-                            println!("{}", r.is_locked());
-                        }
                     }
                     Timer::Verify(res) => {
                         if let Some(mut guard) = res.try_lock() {
@@ -379,15 +374,20 @@ impl<T: Send, E> PoolInner<T, E> {
 }
 
 pub struct Pool<T: Send + 'static, E: 'static> {
-    pub(crate) inner: Arc<PoolInner<T, E>>,
+    pub(crate) inner: Sentinel<PoolInner<T, E>>,
 }
 
 impl<T: Send, E> Pool<T, E> {
     pub(crate) fn new(inner: PoolInner<T, E>) -> Self {
         let inner = Arc::new(inner);
         let mgr = inner.clone();
+        let sentinel = Sentinel::new(inner, |inner, count| {
+            if count == 0 {
+                inner.shutdown();
+            }
+        });
         std::thread::spawn(move || mgr.manage());
-        Self { inner }
+        Self { inner: sentinel }
     }
 
     pub fn acquire(&self) -> Acquire<T, E> {
@@ -398,7 +398,7 @@ impl<T: Send, E> Pool<T, E> {
         &self.inner.queue
     }
 
-    pub fn shutdown(&self, timeout: Duration) -> PoolShutdown {
+    pub fn shutdown(self, timeout: Duration) -> PoolShutdown {
         let (send, receive) = waiter_pair();
         self.inner
             .manage
@@ -414,12 +414,6 @@ impl<T: Send, E> Clone for Pool<T, E> {
         Self {
             inner: self.inner.clone(),
         }
-    }
-}
-
-impl<T: Send, E> Drop for Pool<T, E> {
-    fn drop(&mut self) {
-        self.inner.shutdown();
     }
 }
 

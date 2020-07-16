@@ -33,26 +33,25 @@ fn test_pool_acquire_order_timeout() {
         })
         .build();
 
-    let pcopy = pool.clone();
-    let next = || pcopy.acquire();
     block_on(async move {
-        let mut fst = next().await.unwrap();
-        let mut snd = next().await.unwrap();
+        let mut fst = pool.acquire().await.unwrap();
+        let mut snd = pool.acquire().await.unwrap();
         assert_eq!(*fst, 1);
         assert_eq!(*snd, 2);
 
         // 2 should be returned directly to the idle queue
         drop(snd);
-        snd = next().await.unwrap();
+        snd = pool.acquire().await.unwrap();
         assert_eq!(*snd, 2);
 
         // 1 should be returned directly to the idle queue
         drop(fst);
-        fst = next().await.unwrap();
+        fst = pool.acquire().await.unwrap();
         assert_eq!(*fst, 1);
 
         // with all resources dropped, shutdown should be quick
         drop(fst);
+        drop(snd);
         assert_eq!(pool.shutdown(Duration::from_millis(500)).await, true);
 
         assert_eq!(disposed.value(), 2);
@@ -73,11 +72,9 @@ fn test_pool_acquire_order_no_timeout() {
         })
         .build();
 
-    let pcopy = pool.clone();
-    let next = || pcopy.acquire();
     block_on(async move {
-        let fst = next().await.unwrap();
-        let snd = next().await.unwrap();
+        let fst = pool.acquire().await.unwrap();
+        let snd = pool.acquire().await.unwrap();
         assert_eq!(*fst, 1);
         assert_eq!(*snd, 2);
         drop(snd);
@@ -85,7 +82,7 @@ fn test_pool_acquire_order_no_timeout() {
         // when there is no idle timeout and the pool is not busy (no waiters)
         // then 2 should be send to the verify queue and disposed, not returned
         // to the idle queue
-        let trd = next().await.unwrap();
+        let trd = pool.acquire().await.unwrap();
         assert_eq!(*trd, 3);
 
         drop(fst);
