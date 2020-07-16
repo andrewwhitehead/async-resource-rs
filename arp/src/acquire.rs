@@ -7,11 +7,12 @@ use super::error::AcquireError;
 use super::managed::Managed;
 use super::pool::Pool;
 use super::resource::ResourceResolve;
+use super::wait::Waiter;
 
 enum AcquireState<T: Send + 'static, E: 'static> {
     Init,
-    // Waiting(Waiter)
     Resolve(ResourceResolve<T, E>),
+    Waiting(Waiter<ResourceResolve<T, E>>),
 }
 
 pub struct Acquire<T: Send + 'static, E: 'static> {
@@ -45,6 +46,8 @@ impl<T: Send, E> Future for Acquire<T, E> {
         loop {
             state = match state {
                 AcquireState::Init => {
+                    // FIXME check timer since we may return here after a failure
+
                     // Try to acquire from the idle queue
                     let mut resolve = self.pool.inner.try_acquire_idle();
                     if resolve.is_empty() {
@@ -53,15 +56,18 @@ impl<T: Send, E> Future for Acquire<T, E> {
                     }
 
                     if resolve.is_empty() {
-                        // FIXME Register a waiter
-                        AcquireState::Init
+                        // Register a waiter
+                        let waiter = self.pool.inner.try_wait(self.start);
+                        AcquireState::Waiting(waiter)
                     } else {
+                        // Evaluate any attached future if necessary
                         AcquireState::Resolve(resolve)
                     }
                 }
 
                 AcquireState::Resolve(mut resolve) => match Pin::new(&mut resolve).poll(cx) {
                     Poll::Pending => {
+                        // FIXME check timer (need to register one)
                         self.state.replace(AcquireState::Resolve(resolve));
                         return Poll::Pending;
                     }
@@ -75,14 +81,18 @@ impl<T: Send, E> Future for Acquire<T, E> {
                         // Something went wrong during the resolve, start over
                         AcquireState::Init
                     }
-                }, // AcquireState::Wait(timer) => {
-                   //     if timer.completed.load(Ordering::Acquire) {
-                   //         return Poll::Ready(Err(AcquireError::Timeout));
-                   //     }
-                   //     timer.update(Some(cx.waker()));
-                   //     self.inner.replace(AcquireState::Wait(timer));
-                   //     return Poll::Pending;
-                   // }
+                },
+
+                AcquireState::Waiting(mut waiter) => match Pin::new(&mut *waiter).poll(cx) {
+                    Poll::Pending => {
+                        self.state.replace(AcquireState::Waiting(waiter));
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(result) => match result {
+                        Ok(resolve) => AcquireState::Resolve(resolve),
+                        Err(_) => return Poll::Ready(Err(AcquireError::Timeout)),
+                    },
+                },
             };
         }
     }

@@ -67,17 +67,24 @@ impl<T> Queue<T> {
             res.info().last_idle.replace(now);
             res.info().verify_at = verify_at;
             let lock = res.unlock();
+            let busy = self.busy.load(Ordering::Acquire);
 
             // Add a verify timer.
-            if verify_at.is_some() {
+            // When there is no idle timeout and the queue is not busy, the
+            // verify timer serves to let the manager dispose of the resource
+            // instead of returning it to the idle queue.
+            if verify_at.is_some() || !busy {
                 // The queue is never closed or full, so this should not fail.
                 self.event_queue
-                    .push(QueueEvent::Verify(verify_at.clone().unwrap(), lock.clone()))
+                    .push(QueueEvent::Verify(
+                        verify_at.clone().unwrap_or_else(|| Instant::now()),
+                        lock.clone(),
+                    ))
                     .unwrap_or(());
             }
 
             // Return the resource to the idle queue.
-            if verify_at.is_some() || self.busy.load(Ordering::Acquire) {
+            if verify_at.is_some() || busy {
                 // The queue is never closed or full, so this should not fail.
                 // If it does then the resource is simply dropped.
                 self.idle_queue.push(lock).unwrap_or(());

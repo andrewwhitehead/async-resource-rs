@@ -16,6 +16,7 @@ use super::acquire::Acquire;
 use super::executor::Executor;
 use super::queue::{Queue, QueueEvent};
 use super::resource::{Lifecycle, ResourceFuture, ResourceInfo, ResourceLock, ResourceResolve};
+use super::sentinel::Sentinel;
 use super::wait::{waiter_pair, WaitResponder, Waiter};
 use super::waker::QueueWaiter;
 
@@ -67,11 +68,32 @@ impl<T: Send, E> PoolInner<T, E> {
         }
     }
 
+    pub fn create_from_count(&self) -> Option<usize> {
+        let count = self.queue.count.load(Ordering::Acquire);
+        if self
+            .queue
+            .max_count
+            .clone()
+            .map(|max| max > count)
+            .unwrap_or(true)
+        {
+            Some(count)
+        } else {
+            None
+        }
+    }
+
     pub fn handle_error(&self, err: E) {
         self.manage.lifecycle.handle_error(err);
     }
 
     fn manage(self: Arc<Self>) {
+        let inner = Sentinel::new(self, |inner, _| {
+            // Set the state to Stopped when this thread exits, whether normally
+            // or due to a panic.
+            inner.manage.state.store(STOPPED, Ordering::Release);
+            println!("shutdown");
+        });
         let mut next_check = None;
         let mut repo = HashSet::<ResourceLock<T>>::new();
         let mut timer_id_source: usize = 0;
@@ -84,6 +106,10 @@ impl<T: Send, E> PoolInner<T, E> {
                 match timer {
                     Timer::Shutdown(_) => {
                         // Just drop the shutdown timer to indicate we haven't finished
+                        println!("shutdown expired {}", repo.len());
+                        if let Some(r) = repo.iter().next() {
+                            println!("{}", r.is_locked());
+                        }
                     }
                     Timer::Verify(res) => {
                         if let Some(mut guard) = res.try_lock() {
@@ -95,19 +121,19 @@ impl<T: Send, E> PoolInner<T, E> {
 
                             if guard.is_some() && guard.info().verify_at == Some(inst) {
                                 // Act upon the verify timer
-                                let op = if self.queue.count.load(Ordering::Acquire)
-                                    > self.queue.min_count
+                                let op = if inner.queue.count.load(Ordering::Acquire)
+                                    > inner.queue.min_count
                                 {
-                                    self.manage.lifecycle.dispose(guard, &self)
+                                    inner.manage.lifecycle.dispose(guard, &inner)
                                 } else {
-                                    self.manage.lifecycle.keepalive(guard, &self)
+                                    inner.manage.lifecycle.keepalive(guard, &inner)
                                 };
-                                self.complete_resolve(op);
+                                inner.complete_resolve(op);
                             } else {
                                 // The resource was reacquired and released after the
                                 // verify timer was set.
                                 repo.insert(guard.as_lock());
-                                self.queue.release(guard);
+                                inner.queue.release(guard);
                             }
                         } else {
                             // If the resource is locked, then a consumer thread
@@ -123,6 +149,7 @@ impl<T: Send, E> PoolInner<T, E> {
                     }
                 }
             }
+            // remain_timers.drain_filter(|_, timer| timer.is_canceled());
             timers = remain_timers;
 
             if let Some(fst) = timers.keys().next() {
@@ -131,9 +158,9 @@ impl<T: Send, E> PoolInner<T, E> {
 
             // Set the waiter state to Idle.
             // If anything is subsequently added to the queues, it will move to Busy.
-            self.manage.queue_waiter.prepare_wait();
+            inner.manage.queue_waiter.prepare_wait();
 
-            while let Ok(event) = self.queue.event_queue.pop() {
+            while let Ok(event) = inner.queue.event_queue.pop() {
                 match event {
                     QueueEvent::Created(res) => {
                         repo.insert(res);
@@ -148,7 +175,7 @@ impl<T: Send, E> PoolInner<T, E> {
                 }
             }
 
-            while let Ok(register) = self.manage.register_inject.pop() {
+            while let Ok(register) = inner.manage.register_inject.pop() {
                 match register {
                     Register::Shutdown(expire, notify) => {
                         timer_id_source += 1;
@@ -156,7 +183,7 @@ impl<T: Send, E> PoolInner<T, E> {
                     }
                     Register::Waiter(start, waiter) => {
                         if let Some(expire) =
-                            self.manage.acquire_timeout.clone().map(|dur| start + dur)
+                            inner.manage.acquire_timeout.clone().map(|dur| start + dur)
                         {
                             timer_id_source += 1;
                             timers.insert((expire, timer_id_source), Timer::Waiter(waiter.clone()));
@@ -167,33 +194,49 @@ impl<T: Send, E> PoolInner<T, E> {
             }
 
             if waiters.is_empty() {
-                self.queue
+                inner
+                    .queue
                     .busy
                     .compare_and_swap(true, false, Ordering::Release);
             } else {
-                let mut res = None;
-                while let Some(waiter) = waiters.pop_front() {
-                    if waiter.is_canceled() {
-                        continue;
-                    }
-                    // Bypasses busy check because we are satisfying waiters
-                    if let Some(idle) = res.take().or_else(|| self.queue.try_acquire_idle()) {
-                        if let Err(mut failed) = waiter.send((idle, self.queue.clone()).into()) {
-                            res = failed.take_resource()
+                // This triggers released resources to go to the idle queue even when
+                // there is no idle timeout, and prevents subsequent acquires from stealing
+                // directly from the idle queue so that the waiters are completed first
+                inner
+                    .queue
+                    .busy
+                    .compare_and_swap(false, true, Ordering::Release);
+
+                if !inner.queue.idle_queue.is_empty() || inner.create_from_count().is_some() {
+                    let mut res = None;
+                    while let Some(waiter) = waiters.pop_front() {
+                        if waiter.is_canceled() {
+                            continue;
+                        }
+                        // Bypasses busy check because we are satisfying waiters
+                        if let Some(idle) = res.take().or_else(|| inner.queue.try_acquire_idle()) {
+                            if let Err(mut failed) = waiter.send((idle, inner.queue.clone()).into())
+                            {
+                                res = failed.take_resource()
+                            }
+                        } else {
+                            // Return waiter, no resources available
+                            waiters.push_front(waiter);
+                            break;
                         }
                     }
-                }
-                // No active waiters were found, return the resource to the queue
-                if let Some(res) = res {
-                    self.queue.release(res);
+                    // No active waiters were found, return the resource to the queue
+                    if let Some(res) = res {
+                        inner.queue.release(res);
+                    }
                 }
             }
 
-            let state = self.manage.state.load(Ordering::Acquire);
+            let state = inner.manage.state.load(Ordering::Acquire);
             if state == SHUTDOWN {
                 for res in repo.iter() {
                     if let Some(guard) = res.try_lock() {
-                        self.complete_resolve(self.manage.lifecycle.dispose(guard, &self));
+                        inner.complete_resolve(inner.manage.lifecycle.dispose(guard, &inner));
                     }
                 }
                 repo.retain(|res| !res.is_none());
@@ -203,14 +246,26 @@ impl<T: Send, E> PoolInner<T, E> {
             }
 
             if let Some(next_check) = next_check {
-                self.manage.queue_waiter.wait_until(next_check);
+                inner.manage.queue_waiter.wait_until(next_check);
             } else {
-                self.manage.queue_waiter.wait();
+                inner.manage.queue_waiter.wait();
             }
             next_check = None;
         }
 
         // FIXME wait for executor to complete
+
+        for (_, timer) in timers {
+            match timer {
+                Timer::Shutdown(waiter) => {
+                    // Send true to indicate that the shutdown succeeded.
+                    // Not bothered if the send fails.
+                    waiter.send(true).unwrap_or(());
+                }
+                // Drop any other waiters, leading them to be cancelled
+                _ => (),
+            }
+        }
     }
 
     pub fn complete_resolve(self: &Arc<Self>, res: ResourceResolve<T, E>) {
@@ -269,16 +324,10 @@ impl<T: Send, E> PoolInner<T, E> {
     }
 
     pub fn try_create(self: &Arc<Self>) -> ResourceResolve<T, E> {
-        let mut count = self.queue.count.load(Ordering::Acquire);
-        if !self
-            .queue
-            .max_count
-            .clone()
-            .map(|max| max > count)
-            .unwrap_or(true)
-        {
-            return ResourceResolve::empty();
-        }
+        let mut count = match self.create_from_count() {
+            Some(c) => c,
+            None => return ResourceResolve::empty(),
+        };
 
         loop {
             match self.queue.count.compare_exchange_weak(
@@ -296,6 +345,7 @@ impl<T: Send, E> PoolInner<T, E> {
                         .event_queue
                         .push(QueueEvent::Created(guard.as_lock()))
                         .unwrap_or(());
+                    self.queue.notify();
                     break self.manage.lifecycle.create(guard, self);
                 }
                 Err(c) => {
@@ -317,12 +367,13 @@ impl<T: Send, E> PoolInner<T, E> {
         }
     }
 
-    pub fn try_wait(self: &Arc<Self>) -> Waiter<ResourceResolve<T, E>> {
+    pub fn try_wait(self: &Arc<Self>, started: Instant) -> Waiter<ResourceResolve<T, E>> {
         let (send, receive) = waiter_pair();
         self.manage
             .register_inject
-            .push(Register::Waiter(Instant::now(), send))
+            .push(Register::Waiter(started, send))
             .unwrap_or(());
+        self.queue.notify();
         receive
     }
 }
@@ -387,12 +438,22 @@ pub struct PoolShutdown {
     receive: Waiter<bool>,
 }
 
+impl<T: Send + 'static, E: 'static> Timer<T, E> {
+    // fn is_canceled(&self) -> bool {
+    //     match self {
+    //         Self::Shutdown(ref wait) => wait.is_canceled(),
+    //         Self::Verify(..) => false,
+    //         Self::Waiter(ref wait) => wait.is_canceled(),
+    //     }
+    // }
+}
+
 impl Future for PoolShutdown {
     type Output = bool;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut *self.receive)
             .poll(cx)
-            .map(|result| result.unwrap_or(true))
+            .map(|result| result.unwrap_or(false))
     }
 }
 

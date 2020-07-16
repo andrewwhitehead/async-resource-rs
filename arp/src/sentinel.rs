@@ -20,10 +20,12 @@ impl<T> Sentinel<T> {
         Arc::strong_count(&self.on_drop)
     }
 
+    #[allow(unused)]
     pub fn cancel(mut self) -> Arc<T> {
         self.state.take().unwrap()
     }
 
+    #[allow(unused)]
     pub fn try_unwrap(mut self) -> Result<T, Self> {
         let state = self.state.take().unwrap();
         Arc::try_unwrap(state).map_err(|state| {
@@ -43,7 +45,7 @@ impl<T> Clone for Sentinel<T> {
 }
 
 impl<T> std::ops::Deref for Sentinel<T> {
-    type Target = T;
+    type Target = Arc<T>;
     fn deref(&self) -> &Self::Target {
         &*self.state.as_ref().unwrap()
     }
