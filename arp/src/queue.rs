@@ -18,7 +18,7 @@ pub struct Queue<T> {
     pub(crate) event_queue: ConcurrentQueue<QueueEvent<T>>,
     pub(crate) idle_queue: ConcurrentQueue<ResourceLock<T>>,
     pub(crate) idle_timeout: Option<Duration>,
-    pub(crate) max_count: Option<usize>,
+    pub(crate) max_count: usize,
     pub(crate) min_count: usize,
 
     pub(crate) waker: QueueWaker,
@@ -27,7 +27,7 @@ pub struct Queue<T> {
 impl<T> Queue<T> {
     pub fn new(
         min_count: usize,
-        max_count: Option<usize>,
+        max_count: usize,
         idle_timeout: Option<Duration>,
     ) -> (Self, QueueWaiter) {
         let (waker, waiter) = queue_waker();

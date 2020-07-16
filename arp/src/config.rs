@@ -11,7 +11,7 @@ pub struct PoolConfig<T: Send, E> {
     acquire_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     min_count: usize,
-    max_count: Option<usize>,
+    max_count: usize,
     max_waiters: Option<usize>,
     thread_count: Option<usize>,
     lifecycle: Lifecycle<T, E>,
@@ -30,7 +30,7 @@ impl<T: Send, E> PoolConfig<T, E> {
             acquire_timeout: None,
             idle_timeout: None,
             min_count: 0,
-            max_count: None,
+            max_count: 0,
             max_waiters: None,
             thread_count: None,
             lifecycle,
@@ -90,11 +90,7 @@ impl<T: Send, E> PoolConfig<T, E> {
     }
 
     pub fn max_count(mut self, val: usize) -> Self {
-        if val > 0 {
-            self.max_count.replace(val);
-        } else {
-            self.max_count.take();
-        }
+        self.max_count = val;
         self
     }
 

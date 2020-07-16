@@ -47,7 +47,7 @@ impl<T: Send, E> PoolInner<T, E> {
         acquire_timeout: Option<Duration>,
         idle_timeout: Option<Duration>,
         min_count: usize,
-        max_count: Option<usize>,
+        max_count: usize,
         max_waiters: Option<usize>,
         thread_count: Option<usize>,
     ) -> Self {
@@ -70,13 +70,8 @@ impl<T: Send, E> PoolInner<T, E> {
 
     pub fn create_from_count(&self) -> Option<usize> {
         let count = self.queue.count.load(Ordering::Acquire);
-        if self
-            .queue
-            .max_count
-            .clone()
-            .map(|max| max > count)
-            .unwrap_or(true)
-        {
+        let max = self.queue.max_count;
+        if max == 0 || max > count {
             Some(count)
         } else {
             None
@@ -323,6 +318,7 @@ impl<T: Send, E> PoolInner<T, E> {
             Some(c) => c,
             None => return ResourceResolve::empty(),
         };
+        let max = self.queue.max_count;
 
         loop {
             match self.queue.count.compare_exchange_weak(
@@ -344,14 +340,7 @@ impl<T: Send, E> PoolInner<T, E> {
                     break self.manage.lifecycle.create(guard, self);
                 }
                 Err(c) => {
-                    if c > count
-                        && !self
-                            .queue
-                            .max_count
-                            .clone()
-                            .map(|max| max > c)
-                            .unwrap_or(true)
-                    {
+                    if c > count && max != 0 && c > max {
                         // Count was increased beyond max by another thread
                         break ResourceResolve::empty();
                     }
