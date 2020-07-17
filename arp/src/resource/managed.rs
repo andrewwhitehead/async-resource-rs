@@ -2,19 +2,19 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use super::queue::Queue;
-use super::resource::ResourceGuard;
+use super::ResourceGuard;
+use crate::shared::Shared;
 
 pub struct Managed<T> {
+    shared: Option<Arc<Shared<T>>>,
     value: Option<ResourceGuard<T>>,
-    queue: Option<Arc<Queue<T>>>,
 }
 
 impl<T> Managed<T> {
-    pub(crate) fn new(value: ResourceGuard<T>, queue: Arc<Queue<T>>) -> Self {
+    pub(crate) fn new(value: ResourceGuard<T>, shared: Arc<Shared<T>>) -> Self {
         Self {
+            shared: Some(shared),
             value: Some(value),
-            queue: Some(queue),
         }
     }
 }
@@ -55,8 +55,8 @@ impl<T> DerefMut for Managed<T> {
 
 impl<T> Drop for Managed<T> {
     fn drop(&mut self) {
-        if let Some(queue) = self.queue.take() {
-            queue.release(self.value.take().unwrap());
+        if let Some(shared) = self.shared.take() {
+            shared.release(self.value.take().unwrap());
         }
     }
 }

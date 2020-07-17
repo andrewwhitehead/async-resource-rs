@@ -42,6 +42,7 @@ impl<T> ResourceLock<T> {
         }
     }
 
+    #[allow(unused)]
     pub fn is_locked(&self) -> bool {
         self.inner.state.load(Ordering::Acquire) == HELD
     }
@@ -59,18 +60,7 @@ impl<T> ResourceLock<T> {
         }
     }
 
-    pub fn try_take(&self) -> Option<T> {
-        self.inner
-            .state
-            .compare_exchange(SOME, HELD, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .and_then(|_| {
-                let result = unsafe { (*self.inner.data.get()).1.take() };
-                self.inner.state.store(NONE, Ordering::Release);
-                result
-            })
-    }
-
+    #[allow(unused)]
     pub fn try_unwrap(self) -> Result<(ResourceInfo, Option<T>), Self> {
         match Arc::try_unwrap(self.inner) {
             Ok(inner) => Ok(inner.data.into_inner()),
@@ -181,7 +171,7 @@ mod tests {
         assert!(set.contains(&lock));
 
         // try mutating value
-        assert_eq!(lock.try_take(), Some(1u32));
+        lock.try_lock().unwrap().replace(2);
         assert_eq!(lock, lock2);
         assert!(set.contains(&lock));
     }

@@ -3,6 +3,9 @@ use std::time::Instant;
 mod lock;
 pub use lock::{ResourceGuard, ResourceLock};
 
+mod managed;
+pub use managed::Managed;
+
 mod operation;
 pub use operation::{
     resource_create, resource_dispose, resource_update, ResourceFuture, ResourceOperation,

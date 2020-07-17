@@ -11,16 +11,16 @@ const IDLE: u8 = 0;
 const BUSY: u8 = 1;
 const WAKE: u8 = 2;
 
-pub fn queue_waker() -> (QueueWaker, QueueWaiter) {
+pub fn shared_waker() -> (SharedWaker, SharedWaiter) {
     let inner = Arc::new(Inner {
         state: AtomicU8::new(BUSY),
         thread: UnsafeCell::new(MaybeUninit::uninit()),
     });
     (
-        QueueWaker {
+        SharedWaker {
             inner: inner.clone(),
         },
-        QueueWaiter { inner },
+        SharedWaiter { inner },
     )
 }
 
@@ -31,11 +31,11 @@ struct Inner {
 
 unsafe impl Sync for Inner {}
 
-pub struct QueueWaker {
+pub struct SharedWaker {
     inner: Arc<Inner>,
 }
 
-impl QueueWaker {
+impl SharedWaker {
     pub fn wake(&self) {
         if self.inner.state.swap(BUSY, Ordering::Release) == WAKE {
             unsafe { self.inner.thread.get().read().assume_init() }.unpark()
@@ -43,11 +43,11 @@ impl QueueWaker {
     }
 }
 
-pub struct QueueWaiter {
+pub struct SharedWaiter {
     inner: Arc<Inner>,
 }
 
-impl QueueWaiter {
+impl SharedWaiter {
     pub fn prepare_wait(&self) {
         self.inner.state.store(IDLE, Ordering::Release);
         unsafe {

@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use futures_util::future::TryFuture;
 
-use super::pool::{Pool, PoolInner};
-use super::resource::{
+use super::{Pool, PoolInner};
+use crate::resource::{
     resource_create, resource_dispose, resource_update, Lifecycle, ResourceInfo,
 };
 

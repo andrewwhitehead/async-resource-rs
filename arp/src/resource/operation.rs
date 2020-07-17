@@ -9,12 +9,12 @@ use futures_util::future::{BoxFuture, FutureExt, TryFuture, TryFutureExt};
 use super::lock::ResourceGuard;
 use super::ResourceInfo;
 use crate::pool::PoolInner;
-use crate::queue::Queue;
+use crate::shared::Shared;
 
 pub type ResourceFuture<T, E> = BoxFuture<'static, Result<ResourceGuard<T>, E>>;
 
 pub enum ResourceResolveType<T: Send + 'static, E: 'static> {
-    Resource(Option<(ResourceGuard<T>, Arc<Queue<T>>)>),
+    Resource(Option<(ResourceGuard<T>, Arc<Shared<T>>)>),
     Future(ResourceFuture<T, E>, Arc<PoolInner<T, E>>),
 }
 
@@ -42,14 +42,14 @@ impl<T: Send, E> ResourceResolve<T, E> {
     }
 }
 
-impl<T: Send, E> From<(ResourceGuard<T>, Arc<Queue<T>>)> for ResourceResolve<T, E> {
-    fn from((guard, queue): (ResourceGuard<T>, Arc<Queue<T>>)) -> Self {
+impl<T: Send, E> From<(ResourceGuard<T>, Arc<Shared<T>>)> for ResourceResolve<T, E> {
+    fn from((guard, queue): (ResourceGuard<T>, Arc<Shared<T>>)) -> Self {
         Self(ResourceResolveType::Resource(Some((guard, queue))))
     }
 }
 
-impl<T: Send, E> From<Option<(ResourceGuard<T>, Arc<Queue<T>>)>> for ResourceResolve<T, E> {
-    fn from(res: Option<(ResourceGuard<T>, Arc<Queue<T>>)>) -> Self {
+impl<T: Send, E> From<Option<(ResourceGuard<T>, Arc<Shared<T>>)>> for ResourceResolve<T, E> {
+    fn from(res: Option<(ResourceGuard<T>, Arc<Shared<T>>)>) -> Self {
         Self(ResourceResolveType::Resource(res))
     }
 }

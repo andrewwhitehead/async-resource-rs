@@ -12,13 +12,24 @@ use concurrent_queue::ConcurrentQueue;
 
 use futures_util::FutureExt;
 
-use super::acquire::Acquire;
-use super::executor::Executor;
-use super::queue::{Queue, QueueEvent};
 use super::resource::{Lifecycle, ResourceFuture, ResourceInfo, ResourceLock, ResourceResolve};
-use super::sentinel::Sentinel;
+use super::shared::{Shared, SharedEvent, SharedWaiter};
 use super::wait::{waiter_pair, WaitResponder, Waiter};
-use super::waker::QueueWaiter;
+
+mod acquire;
+pub use acquire::Acquire;
+
+mod config;
+pub use config::PoolConfig;
+
+mod error;
+pub use error::AcquireError;
+
+mod executor;
+use executor::Executor;
+
+mod sentinel;
+pub use sentinel::Sentinel;
 
 const ACTIVE: u8 = 0;
 const SHUTDOWN: u8 = 1;
@@ -31,14 +42,14 @@ pub(crate) struct PoolManageState<T: Send + 'static, E: 'static> {
     executor: Executor,
     lifecycle: Lifecycle<T, E>,
     max_waiters: Option<usize>,
-    queue_waiter: QueueWaiter,
+    shared_waiter: SharedWaiter,
     register_inject: ConcurrentQueue<Register<T, E>>,
     state: AtomicU8,
 }
 
 pub struct PoolInner<T: Send + 'static, E: 'static> {
     manage: PoolManageState<T, E>,
-    queue: Arc<Queue<T>>,
+    shared: Arc<Shared<T>>,
 }
 
 impl<T: Send, E> PoolInner<T, E> {
@@ -52,25 +63,25 @@ impl<T: Send, E> PoolInner<T, E> {
         thread_count: Option<usize>,
     ) -> Self {
         let executor = Executor::new(thread_count.unwrap_or(1));
-        let (queue, queue_waiter) = Queue::new(min_count, max_count, idle_timeout);
+        let (shared, shared_waiter) = Shared::new(min_count, max_count, idle_timeout);
         let manage = PoolManageState {
             acquire_timeout,
             executor,
             lifecycle,
             max_waiters,
-            queue_waiter,
             register_inject: ConcurrentQueue::unbounded(),
+            shared_waiter,
             state: AtomicU8::new(ACTIVE),
         };
         Self {
             manage,
-            queue: Arc::new(queue),
+            shared: Arc::new(shared),
         }
     }
 
     pub fn create_from_count(&self) -> Option<usize> {
-        let count = self.queue.count.load(Ordering::Acquire);
-        let max = self.queue.max_count;
+        let count = self.shared.count.load(Ordering::Acquire);
+        let max = self.shared.max_count;
         if max == 0 || max > count {
             Some(count)
         } else {
@@ -111,8 +122,8 @@ impl<T: Send, E> PoolInner<T, E> {
 
                             if guard.is_some() && guard.info().verify_at == Some(inst) {
                                 // Act upon the verify timer
-                                let op = if inner.queue.count.load(Ordering::Acquire)
-                                    > inner.queue.min_count
+                                let op = if inner.shared.count.load(Ordering::Acquire)
+                                    > inner.shared.min_count
                                 {
                                     inner.manage.lifecycle.dispose(guard, &inner)
                                 } else {
@@ -123,7 +134,7 @@ impl<T: Send, E> PoolInner<T, E> {
                                 // The resource was reacquired and released after the
                                 // verify timer was set.
                                 repo.insert(guard.as_lock());
-                                inner.queue.release(guard);
+                                inner.shared.release(guard);
                             }
                         } else {
                             // If the resource is locked, then a consumer thread
@@ -148,17 +159,17 @@ impl<T: Send, E> PoolInner<T, E> {
 
             // Set the waiter state to Idle.
             // If anything is subsequently added to the queues, it will move to Busy.
-            inner.manage.queue_waiter.prepare_wait();
+            inner.manage.shared_waiter.prepare_wait();
 
-            while let Ok(event) = inner.queue.event_queue.pop() {
+            while let Ok(event) = inner.shared.event_queue.pop() {
                 match event {
-                    QueueEvent::Created(res) => {
+                    SharedEvent::Created(res) => {
                         repo.insert(res);
                     }
-                    QueueEvent::Disposed(res) => {
+                    SharedEvent::Disposed(res) => {
                         repo.remove(&res);
                     }
-                    QueueEvent::Verify(expire, res) => {
+                    SharedEvent::Verify(expire, res) => {
                         timer_id_source += 1;
                         timers.insert((expire, timer_id_source), Timer::Verify(res));
                     }
@@ -185,7 +196,7 @@ impl<T: Send, E> PoolInner<T, E> {
 
             if waiters.is_empty() {
                 inner
-                    .queue
+                    .shared
                     .busy
                     .compare_and_swap(true, false, Ordering::Release);
             } else {
@@ -193,19 +204,20 @@ impl<T: Send, E> PoolInner<T, E> {
                 // there is no idle timeout, and prevents subsequent acquires from stealing
                 // directly from the idle queue so that the waiters are completed first
                 inner
-                    .queue
+                    .shared
                     .busy
                     .compare_and_swap(false, true, Ordering::Release);
 
-                if !inner.queue.idle_queue.is_empty() || inner.create_from_count().is_some() {
+                if !inner.shared.idle_queue.is_empty() || inner.create_from_count().is_some() {
                     let mut res = None;
                     while let Some(waiter) = waiters.pop_front() {
                         if waiter.is_canceled() {
                             continue;
                         }
                         // Bypasses busy check because we are satisfying waiters
-                        if let Some(idle) = res.take().or_else(|| inner.queue.try_acquire_idle()) {
-                            if let Err(mut failed) = waiter.send((idle, inner.queue.clone()).into())
+                        if let Some(idle) = res.take().or_else(|| inner.shared.try_acquire_idle()) {
+                            if let Err(mut failed) =
+                                waiter.send((idle, inner.shared.clone()).into())
                             {
                                 res = failed.take_resource()
                             }
@@ -217,7 +229,7 @@ impl<T: Send, E> PoolInner<T, E> {
                     }
                     // No active waiters were found, return the resource to the queue
                     if let Some(res) = res {
-                        inner.queue.release(res);
+                        inner.shared.release(res);
                     }
                 }
             }
@@ -236,9 +248,9 @@ impl<T: Send, E> PoolInner<T, E> {
             }
 
             if let Some(next_check) = next_check {
-                inner.manage.queue_waiter.wait_until(next_check);
+                inner.manage.shared_waiter.wait_until(next_check);
             } else {
-                inner.manage.queue_waiter.wait();
+                inner.manage.shared_waiter.wait();
             }
             next_check = None;
         }
@@ -263,7 +275,7 @@ impl<T: Send, E> PoolInner<T, E> {
             let inner = self.clone();
             self.manage.executor.spawn_ok(res.map(move |res| match res {
                 Some(Ok(res)) => {
-                    inner.queue.release(res);
+                    inner.shared.release(res);
                 }
                 Some(Err(err)) => {
                     inner.handle_error(err);
@@ -287,7 +299,7 @@ impl<T: Send, E> PoolInner<T, E> {
                 Ordering::Acquire,
             ) {
                 Ok(_) | Err(SHUTDOWN) => {
-                    self.queue.notify();
+                    self.shared.notify();
                     break true;
                 }
                 Err(STOPPED) => {
@@ -302,13 +314,13 @@ impl<T: Send, E> PoolInner<T, E> {
     }
 
     pub fn try_acquire_idle(self: &Arc<Self>) -> ResourceResolve<T, E> {
-        if self.queue.busy.load(Ordering::Acquire) {
+        if self.shared.busy.load(Ordering::Acquire) {
             ResourceResolve::empty()
         } else {
             // Wrap the resource guard to ensure it is returned to the queue
-            self.queue
+            self.shared
                 .try_acquire_idle()
-                .map(|res| (res, self.queue.clone()))
+                .map(|res| (res, self.shared.clone()))
                 .into()
         }
     }
@@ -318,10 +330,10 @@ impl<T: Send, E> PoolInner<T, E> {
             Some(c) => c,
             None => return ResourceResolve::empty(),
         };
-        let max = self.queue.max_count;
+        let max = self.shared.max_count;
 
         loop {
-            match self.queue.count.compare_exchange_weak(
+            match self.shared.count.compare_exchange_weak(
                 count,
                 count + 1,
                 Ordering::SeqCst,
@@ -332,11 +344,11 @@ impl<T: Send, E> PoolInner<T, E> {
                     let lock = ResourceLock::new(ResourceInfo::default(), None);
                     let guard = lock.try_lock().unwrap();
                     // Not concerned with failure here
-                    self.queue
+                    self.shared
                         .event_queue
-                        .push(QueueEvent::Created(guard.as_lock()))
+                        .push(SharedEvent::Created(guard.as_lock()))
                         .unwrap_or(());
-                    self.queue.notify();
+                    self.shared.notify();
                     break self.manage.lifecycle.create(guard, self);
                 }
                 Err(c) => {
@@ -357,7 +369,7 @@ impl<T: Send, E> PoolInner<T, E> {
             .register_inject
             .push(Register::Waiter(started, send))
             .unwrap_or(());
-        self.queue.notify();
+        self.shared.notify();
         receive
     }
 }
@@ -383,8 +395,8 @@ impl<T: Send, E> Pool<T, E> {
         Acquire::new(self.clone())
     }
 
-    pub(crate) fn queue(&self) -> &Arc<Queue<T>> {
-        &self.inner.queue
+    pub(crate) fn shared(&self) -> &Arc<Shared<T>> {
+        &self.inner.shared
     }
 
     pub fn shutdown(self, timeout: Duration) -> PoolShutdown {
