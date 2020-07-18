@@ -1,3 +1,4 @@
+use std::fmt::{self, Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
@@ -40,8 +41,22 @@ impl<T> Clone for WaitResponder<T> {
     }
 }
 
+impl<T> Debug for WaitResponder<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WaitResponder")
+            .field("is_canceled", &self.is_canceled())
+            .finish()
+    }
+}
+
 pub struct Waiter<T> {
     receiver: dropshot::Receiver<T>,
+}
+
+impl<T> Debug for Waiter<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Waiter").finish()
+    }
 }
 
 impl<T> Deref for Waiter<T> {

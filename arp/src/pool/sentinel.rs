@@ -1,3 +1,4 @@
+use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 pub struct Sentinel<T> {
@@ -41,6 +42,12 @@ impl<T> Clone for Sentinel<T> {
             state: self.state.clone(),
             on_drop: self.on_drop.clone(),
         }
+    }
+}
+
+impl<T: Debug> Debug for Sentinel<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Sentinel").field(&self.state).finish()
     }
 }
 

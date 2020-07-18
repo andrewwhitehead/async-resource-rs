@@ -100,8 +100,9 @@ impl<T: Send, E> PoolInternal<T, E> {
     }
 
     pub fn create(self: &Arc<Self>) -> ResourceResolve<T, E> {
-        // FIXME repo not required if there is no resource expiry?
-        let lock = ResourceLock::new(ResourceInfo::default(), None);
+        let mut info = ResourceInfo::default();
+        info.reusable = self.shared.can_reuse();
+        let lock = ResourceLock::new(info, None);
         let guard = lock.try_lock().unwrap();
 
         // Send the resource lock into the repo, for collection later
@@ -327,6 +328,14 @@ impl<T: Send, E> PoolInternal<T, E> {
         self.complete_resolve(ResourceResolve::from((fut.boxed(), self.clone())));
     }
 
+    fn register(&self, reg: Register<T, E>) {
+        self.manage
+            .register_inject
+            .push(reg)
+            .unwrap_or_else(|_| panic!("Pool manager injector error"));
+        self.shared.notify();
+    }
+
     pub fn shared(&self) -> &Arc<Shared<T>> {
         &self.shared
     }
@@ -402,10 +411,7 @@ impl<T: Send, E> PoolInternal<T, E> {
 
     pub fn try_wait(self: &Arc<Self>, started: Instant) -> Waiter<ResourceResolve<T, E>> {
         let (send, receive) = waiter_pair();
-        self.manage
-            .register_inject
-            .push(Register::Waiter(started, send))
-            .unwrap_or(());
+        self.register(Register::Waiter(started, send));
         self.shared.notify();
         receive
     }
@@ -450,10 +456,7 @@ impl<T: Send, E> Pool<T, E> {
     pub fn drain(self, timeout: Duration) -> PoolDrain<T, E> {
         let (send, receive) = waiter_pair();
         self.inner
-            .manage
-            .register_inject
-            .push(Register::Drain(Instant::now() + timeout, send))
-            .unwrap_or(());
+            .register(Register::Drain(Instant::now() + timeout, send));
         PoolDrain {
             inner: Some(self.inner),
             receive,
@@ -477,20 +480,17 @@ impl<T: Send, E> Debug for Pool<T, E> {
     }
 }
 
+#[derive(Debug)]
 enum Register<T: Send + 'static, E: 'static> {
     Drain(Instant, WaitResponder<bool>),
     Waiter(Instant, WaitResource<T, E>),
 }
 
+#[derive(Debug)]
 enum Timer<T: Send + 'static, E: 'static> {
     Drain(WaitResponder<bool>),
     Verify(ResourceLock<T>),
     Waiter(WaitResource<T, E>),
-}
-
-pub struct PoolDrain<T: Send + 'static, E: 'static> {
-    inner: Option<Sentinel<PoolInternal<T, E>>>,
-    receive: Waiter<bool>,
 }
 
 impl<T: Send + 'static, E: 'static> Timer<T, E> {
@@ -501,6 +501,17 @@ impl<T: Send + 'static, E: 'static> Timer<T, E> {
     //         Self::Waiter(ref wait) => wait.is_canceled(),
     //     }
     // }
+}
+
+pub struct PoolDrain<T: Send + 'static, E: 'static> {
+    inner: Option<Sentinel<PoolInternal<T, E>>>,
+    receive: Waiter<bool>,
+}
+
+impl<T: Send + 'static, E: 'static> Debug for PoolDrain<T, E> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PoolDrain").finish()
+    }
 }
 
 impl<T: Send, E> Future for PoolDrain<T, E> {

@@ -75,9 +75,13 @@ impl<T> Shared<T> {
         self.notify();
     }
 
+    pub fn can_reuse(&self) -> bool {
+        self.idle_timeout.is_some()
+    }
+
     #[inline]
     fn check_reuse(&self, guard: &mut ResourceGuard<T>) -> bool {
-        if guard.is_some() && guard.info().reusable || self.busy.load(Ordering::Acquire) {
+        if guard.is_some() && (guard.info().reusable || self.busy.load(Ordering::Acquire)) {
             if let Some(check) = self.on_release.as_ref() {
                 let info = *guard.info();
                 (check)(guard.as_mut().unwrap(), info)
