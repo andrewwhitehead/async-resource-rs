@@ -12,8 +12,8 @@ use concurrent_queue::ConcurrentQueue;
 
 use futures_util::FutureExt;
 
-use super::resource::{Lifecycle, ResourceFuture, ResourceInfo, ResourceLock, ResourceResolve};
-use super::shared::{Shared, SharedEvent, SharedWaiter};
+use super::resource::{ResourceGuard, ResourceInfo, ResourceLock};
+use super::shared::{DisposeFn, ReleaseFn, Shared, SharedEvent, SharedWaiter};
 use super::wait::{waiter_pair, WaitResponder, Waiter};
 
 mod acquire;
@@ -28,6 +28,11 @@ pub use error::AcquireError;
 mod executor;
 use executor::Executor;
 
+mod operation;
+use operation::{
+    resource_create, resource_verify, ResourceFuture, ResourceOperation, ResourceResolve,
+};
+
 mod sentinel;
 pub use sentinel::Sentinel;
 
@@ -35,43 +40,56 @@ const ACTIVE: u8 = 0;
 const SHUTDOWN: u8 = 1;
 const STOPPED: u8 = 2;
 
+type BoxedOperation<T, E> = Box<dyn ResourceOperation<T, E> + Send + Sync>;
+
+type ErrorFn<E> = Box<dyn Fn(E) + Send + Sync>;
+
 type WaitResource<T, E> = WaitResponder<ResourceResolve<T, E>>;
 
 pub(crate) struct PoolManageState<T: Send + 'static, E: 'static> {
     acquire_timeout: Option<Duration>,
+    create: BoxedOperation<T, E>,
     executor: Executor,
-    lifecycle: Lifecycle<T, E>,
+    handle_error: Option<ErrorFn<E>>,
     max_waiters: Option<usize>,
     shared_waiter: SharedWaiter,
     register_inject: ConcurrentQueue<Register<T, E>>,
     state: AtomicU8,
+    verify: Option<BoxedOperation<T, E>>,
 }
 
-pub struct PoolInner<T: Send + 'static, E: 'static> {
+pub struct PoolInternal<T: Send + 'static, E: 'static> {
     manage: PoolManageState<T, E>,
     shared: Arc<Shared<T>>,
 }
 
-impl<T: Send, E> PoolInner<T, E> {
+impl<T: Send, E> PoolInternal<T, E> {
     pub fn new(
-        lifecycle: Lifecycle<T, E>,
         acquire_timeout: Option<Duration>,
+        create: Box<dyn ResourceOperation<T, E> + Send + Sync>,
+        handle_error: Option<Box<dyn Fn(E) + Send + Sync>>,
         idle_timeout: Option<Duration>,
         min_count: usize,
         max_count: usize,
         max_waiters: Option<usize>,
+        on_dispose: Option<DisposeFn<T>>,
+        on_release: Option<ReleaseFn<T>>,
         thread_count: Option<usize>,
+        verify: Option<Box<dyn ResourceOperation<T, E> + Send + Sync>>,
     ) -> Self {
         let executor = Executor::new(thread_count.unwrap_or(1));
-        let (shared, shared_waiter) = Shared::new(min_count, max_count, idle_timeout);
+        let (shared, shared_waiter) =
+            Shared::new(on_release, on_dispose, min_count, max_count, idle_timeout);
         let manage = PoolManageState {
             acquire_timeout,
+            create,
             executor,
-            lifecycle,
+            handle_error,
             max_waiters,
             register_inject: ConcurrentQueue::unbounded(),
             shared_waiter,
             state: AtomicU8::new(ACTIVE),
+            verify,
         };
         Self {
             manage,
@@ -79,9 +97,22 @@ impl<T: Send, E> PoolInner<T, E> {
         }
     }
 
+    pub fn create(self: &Arc<Self>) -> ResourceResolve<T, E> {
+        // FIXME repo not required if there is no resource expiry?
+        let lock = ResourceLock::new(ResourceInfo::default(), None);
+        let guard = lock.try_lock().unwrap();
+
+        // Send the resource lock into the repo, for collection later
+        // Not concerned with failure here
+        self.shared
+            .push_event(SharedEvent::Created(guard.as_lock()));
+
+        self.manage.create.apply(guard, self)
+    }
+
     pub fn create_from_count(&self) -> Option<usize> {
-        let count = self.shared.count.load(Ordering::Acquire);
-        let max = self.shared.max_count;
+        let count = self.shared.count();
+        let max = self.shared.max_count();
         if max == 0 || max > count {
             Some(count)
         } else {
@@ -90,7 +121,9 @@ impl<T: Send, E> PoolInner<T, E> {
     }
 
     pub fn handle_error(&self, err: E) {
-        self.manage.lifecycle.handle_error(err);
+        if let Some(handler) = self.manage.handle_error.as_ref() {
+            (handler)(err)
+        }
     }
 
     fn manage(self: Arc<Self>) {
@@ -99,6 +132,7 @@ impl<T: Send, E> PoolInner<T, E> {
             // or due to a panic.
             inner.manage.state.store(STOPPED, Ordering::Release);
         });
+        let mut last_dispose_count = 0;
         let mut next_check = None;
         let mut repo = HashSet::<ResourceLock<T>>::new();
         let mut timer_id_source: usize = 0;
@@ -114,32 +148,28 @@ impl<T: Send, E> PoolInner<T, E> {
                     }
                     Timer::Verify(res) => {
                         if let Some(mut guard) = res.try_lock() {
-                            // The clone of the resource lock in the idle queue can't be
+                            // Any clone of the resource lock in the idle queue can't be
                             // acquired at the moment, so forget that lock and create a
-                            // new one.
+                            // new one
                             repo.remove(&guard.as_lock());
                             guard = guard.detach();
 
                             if guard.is_some() && guard.info().verify_at == Some(inst) {
                                 // Act upon the verify timer
-                                let op = if inner.shared.count.load(Ordering::Acquire)
-                                    > inner.shared.min_count
-                                {
-                                    inner.manage.lifecycle.dispose(guard, &inner)
-                                } else {
-                                    inner.manage.lifecycle.keepalive(guard, &inner)
-                                };
-                                inner.complete_resolve(op);
+                                inner.verify(guard);
                             } else {
                                 // The resource was reacquired and released after the
-                                // verify timer was set.
+                                // verify timer was set, put it back into the idle queue.
+                                // FIXME attach timer to the resource lock so it can be
+                                // checked without acquiring it
                                 repo.insert(guard.as_lock());
+                                // FIXME this can trigger another verify!
                                 inner.shared.release(guard);
                             }
                         } else {
                             // If the resource is locked, then a consumer thread
                             // has acquired it or is in the process of doing so,
-                            // nothing to do here.
+                            // nothing to do here
                         }
                     }
                     Timer::Waiter(waiter) => {
@@ -161,13 +191,10 @@ impl<T: Send, E> PoolInner<T, E> {
             // If anything is subsequently added to the queues, it will move to Busy.
             inner.manage.shared_waiter.prepare_wait();
 
-            while let Ok(event) = inner.shared.event_queue.pop() {
+            while let Some(event) = inner.shared.pop_event() {
                 match event {
                     SharedEvent::Created(res) => {
                         repo.insert(res);
-                    }
-                    SharedEvent::Disposed(res) => {
-                        repo.remove(&res);
                     }
                     SharedEvent::Verify(expire, res) => {
                         timer_id_source += 1;
@@ -195,20 +222,16 @@ impl<T: Send, E> PoolInner<T, E> {
             }
 
             if waiters.is_empty() {
-                inner
-                    .shared
-                    .busy
-                    .compare_and_swap(true, false, Ordering::Release);
+                // FIXME dispose idle resources over min_count
+                // because 'busy' allows them to return to the idle queue
+                inner.shared.set_busy(false);
             } else {
                 // This triggers released resources to go to the idle queue even when
                 // there is no idle timeout, and prevents subsequent acquires from stealing
                 // directly from the idle queue so that the waiters are completed first
-                inner
-                    .shared
-                    .busy
-                    .compare_and_swap(false, true, Ordering::Release);
+                inner.shared.set_busy(true);
 
-                if !inner.shared.idle_queue.is_empty() || inner.create_from_count().is_some() {
+                if inner.shared.have_idle() || inner.create_from_count().is_some() {
                     let mut res = None;
                     while let Some(waiter) = waiters.pop_front() {
                         if waiter.is_canceled() {
@@ -238,12 +261,18 @@ impl<T: Send, E> PoolInner<T, E> {
             if state == SHUTDOWN {
                 for res in repo.iter() {
                     if let Some(guard) = res.try_lock() {
-                        inner.complete_resolve(inner.manage.lifecycle.dispose(guard, &inner));
+                        inner.shared.dispose(guard);
                     }
                 }
                 repo.retain(|res| !res.is_none());
                 if repo.is_empty() {
                     break;
+                }
+            } else {
+                let dispose_count = inner.shared.dispose_count();
+                if last_dispose_count != dispose_count {
+                    repo.retain(|res| !res.is_none());
+                    last_dispose_count = dispose_count;
                 }
             }
 
@@ -289,6 +318,10 @@ impl<T: Send, E> PoolInner<T, E> {
         self.complete_resolve(ResourceResolve::from((fut.boxed(), self.clone())));
     }
 
+    pub fn shared(&self) -> &Arc<Shared<T>> {
+        &self.shared
+    }
+
     pub fn shutdown(self: &Arc<Self>) -> bool {
         let mut state = ACTIVE;
         loop {
@@ -314,7 +347,7 @@ impl<T: Send, E> PoolInner<T, E> {
     }
 
     pub fn try_acquire_idle(self: &Arc<Self>) -> ResourceResolve<T, E> {
-        if self.shared.busy.load(Ordering::Acquire) {
+        if self.shared.is_busy() {
             ResourceResolve::empty()
         } else {
             // Wrap the resource guard to ensure it is returned to the queue
@@ -330,26 +363,12 @@ impl<T: Send, E> PoolInner<T, E> {
             Some(c) => c,
             None => return ResourceResolve::empty(),
         };
-        let max = self.shared.max_count;
+        let max = self.shared.max_count();
 
         loop {
-            match self.shared.count.compare_exchange_weak(
-                count,
-                count + 1,
-                Ordering::SeqCst,
-                Ordering::Acquire,
-            ) {
+            match self.shared.try_update_count(count, count + 1) {
                 Ok(_) => {
-                    // FIXME repo not required if there is no resource expiry?
-                    let lock = ResourceLock::new(ResourceInfo::default(), None);
-                    let guard = lock.try_lock().unwrap();
-                    // Not concerned with failure here
-                    self.shared
-                        .event_queue
-                        .push(SharedEvent::Created(guard.as_lock()))
-                        .unwrap_or(());
-                    self.shared.notify();
-                    break self.manage.lifecycle.create(guard, self);
+                    break self.create();
                 }
                 Err(c) => {
                     if c > count && max != 0 && c > max {
@@ -372,14 +391,25 @@ impl<T: Send, E> PoolInner<T, E> {
         self.shared.notify();
         receive
     }
+
+    pub fn verify(self: &Arc<Self>, guard: ResourceGuard<T>) {
+        if guard.info().reusable {
+            if let Some(verify) = self.manage.verify.as_ref() {
+                if self.shared.count() <= self.shared.min_count() {
+                    return self.complete_resolve(verify.apply(guard, &self));
+                }
+            }
+        }
+        self.shared.dispose(guard);
+    }
 }
 
 pub struct Pool<T: Send + 'static, E: 'static> {
-    pub(crate) inner: Sentinel<PoolInner<T, E>>,
+    pub(crate) inner: Sentinel<PoolInternal<T, E>>,
 }
 
 impl<T: Send, E> Pool<T, E> {
-    pub(crate) fn new(inner: PoolInner<T, E>) -> Self {
+    pub(crate) fn new(inner: PoolInternal<T, E>) -> Self {
         let inner = Arc::new(inner);
         let mgr = inner.clone();
         let sentinel = Sentinel::new(inner, |inner, count| {
@@ -395,8 +425,8 @@ impl<T: Send, E> Pool<T, E> {
         Acquire::new(self.clone())
     }
 
-    pub(crate) fn shared(&self) -> &Arc<Shared<T>> {
-        &self.inner.shared
+    pub fn count(&self) -> usize {
+        self.inner.shared.count()
     }
 
     pub fn shutdown(self, timeout: Duration) -> PoolShutdown {

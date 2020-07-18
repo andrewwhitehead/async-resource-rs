@@ -2,7 +2,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use super::ResourceGuard;
+use super::{ResourceGuard, ResourceInfo};
 use crate::shared::Shared;
 
 pub struct Managed<T> {
@@ -16,6 +16,14 @@ impl<T> Managed<T> {
             shared: Some(shared),
             value: Some(value),
         }
+    }
+
+    pub fn discard(mng_self: &mut Self) {
+        mng_self.value.as_mut().unwrap().discard()
+    }
+
+    pub fn info(mng_self: &Self) -> &ResourceInfo {
+        mng_self.value.as_ref().unwrap().info()
     }
 }
 

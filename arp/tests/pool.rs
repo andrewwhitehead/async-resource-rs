@@ -25,11 +25,7 @@ fn test_pool_acquire_order_timeout() {
     let pool = counter_pool_config()
         .idle_timeout(Duration::from_secs(1))
         .dispose(move |_res, _| {
-            let d = dcopy.clone();
-            async move {
-                d.increment();
-                Ok(())
-            }
+            dcopy.increment();
         })
         .build();
 
@@ -64,11 +60,7 @@ fn test_pool_acquire_order_no_timeout() {
     let dcopy = disposed.clone();
     let pool = counter_pool_config()
         .dispose(move |_res, _| {
-            let d = dcopy.clone();
-            async move {
-                d.increment();
-                Ok(())
-            }
+            dcopy.increment();
         })
         .build();
 

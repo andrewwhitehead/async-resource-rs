@@ -2,19 +2,24 @@ use std::time::Duration;
 
 use futures_util::future::TryFuture;
 
-use super::{Pool, PoolInner};
-use crate::resource::{
-    resource_create, resource_dispose, resource_update, Lifecycle, ResourceInfo,
+use super::{
+    resource_create, resource_verify, DisposeFn, ErrorFn, ReleaseFn, ResourceInfo,
+    ResourceOperation,
 };
+use super::{Pool, PoolInternal};
 
 pub struct PoolConfig<T: Send, E> {
     acquire_timeout: Option<Duration>,
+    handle_error: Option<ErrorFn<E>>,
     idle_timeout: Option<Duration>,
     min_count: usize,
     max_count: usize,
     max_waiters: Option<usize>,
+    on_create: Box<dyn ResourceOperation<T, E> + Send + Sync>,
+    on_dispose: Option<DisposeFn<T>>,
+    on_release: Option<ReleaseFn<T>>,
+    on_verify: Option<Box<dyn ResourceOperation<T, E> + Send + Sync>>,
     thread_count: Option<usize>,
-    lifecycle: Lifecycle<T, E>,
 }
 
 impl<T: Send, E> PoolConfig<T, E> {
@@ -25,15 +30,18 @@ impl<T: Send, E> PoolConfig<T, E> {
         T: Send + 'static,
         E: 'static,
     {
-        let lifecycle = Lifecycle::new(Box::new(resource_create(create)));
         Self {
             acquire_timeout: None,
+            handle_error: None,
             idle_timeout: None,
             min_count: 0,
             max_count: 0,
             max_waiters: None,
+            on_create: Box::new(resource_create(create)),
+            on_dispose: None,
+            on_release: None,
+            on_verify: None,
             thread_count: None,
-            lifecycle,
         }
     }
 
@@ -46,16 +54,11 @@ impl<T: Send, E> PoolConfig<T, E> {
         self
     }
 
-    pub fn dispose<D, F>(mut self, dispose: D) -> Self
+    pub fn dispose<F>(mut self, dispose: F) -> Self
     where
-        D: Fn(T, ResourceInfo) -> F + Send + Sync + 'static,
-        F: TryFuture<Ok = (), Error = E> + Send + 'static,
-        T: Send + 'static,
-        E: 'static,
+        F: Fn(T, ResourceInfo) -> () + Send + Sync + 'static,
     {
-        self.lifecycle
-            .dispose
-            .replace(Box::new(resource_dispose(dispose)));
+        self.on_dispose.replace(Box::new(dispose));
         self
     }
 
@@ -63,7 +66,7 @@ impl<T: Send, E> PoolConfig<T, E> {
     where
         F: Fn(E) + Send + Sync + 'static,
     {
-        self.lifecycle.handle_error.replace(Box::new(handler));
+        self.handle_error.replace(Box::new(handler));
         self
     }
 
@@ -76,16 +79,14 @@ impl<T: Send, E> PoolConfig<T, E> {
         self
     }
 
-    pub fn keepalive<K, F>(mut self, keepalive: K) -> Self
+    pub fn verify<V, F>(mut self, verify: V) -> Self
     where
-        K: Fn(T, ResourceInfo) -> F + Send + Sync + 'static,
+        V: Fn(&mut T, ResourceInfo) -> F + Send + Sync + 'static,
         F: TryFuture<Ok = Option<T>, Error = E> + Send + 'static,
         T: Send + 'static,
         E: 'static,
     {
-        self.lifecycle
-            .keepalive
-            .replace(Box::new(resource_update(keepalive)));
+        self.on_verify.replace(Box::new(resource_verify(verify)));
         self
     }
 
@@ -104,6 +105,14 @@ impl<T: Send, E> PoolConfig<T, E> {
         self
     }
 
+    pub fn release<F>(mut self, release: F) -> Self
+    where
+        F: Fn(&mut T, ResourceInfo) -> bool + Send + Sync + 'static,
+    {
+        self.on_release.replace(Box::new(release));
+        self
+    }
+
     pub fn thread_count(mut self, val: usize) -> Self {
         if val > 0 {
             self.thread_count.replace(val);
@@ -114,14 +123,18 @@ impl<T: Send, E> PoolConfig<T, E> {
     }
 
     pub fn build(self) -> Pool<T, E> {
-        let inner = PoolInner::new(
-            self.lifecycle,
+        let inner = PoolInternal::new(
             self.acquire_timeout,
+            self.on_create,
+            self.handle_error,
             self.idle_timeout,
             self.min_count,
             self.max_count,
             self.max_waiters,
+            self.on_dispose,
+            self.on_release,
             self.thread_count,
+            self.on_verify,
         );
         Pool::new(inner)
         // let exec = Executor::new(self.thread_count.unwrap_or(1));

@@ -116,7 +116,15 @@ impl<T> ResourceGuard<T> {
         }
     }
 
-    pub fn info(&mut self) -> &mut ResourceInfo {
+    pub fn discard(&mut self) {
+        self.info_mut().reusable = false;
+    }
+
+    pub fn info(&self) -> &ResourceInfo {
+        unsafe { &mut (*self.lock.data.get()).0 }
+    }
+
+    pub fn info_mut(&mut self) -> &mut ResourceInfo {
         unsafe { &mut (*self.lock.data.get()).0 }
     }
 

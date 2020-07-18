@@ -6,16 +6,13 @@ use std::time::Instant;
 
 use futures_util::future::{BoxFuture, FutureExt, TryFuture, TryFutureExt};
 
-use super::lock::ResourceGuard;
-use super::ResourceInfo;
-use crate::pool::PoolInner;
-use crate::shared::Shared;
+use super::{PoolInternal, ResourceGuard, ResourceInfo, Shared};
 
 pub type ResourceFuture<T, E> = BoxFuture<'static, Result<ResourceGuard<T>, E>>;
 
 pub enum ResourceResolveType<T: Send + 'static, E: 'static> {
     Resource(Option<(ResourceGuard<T>, Arc<Shared<T>>)>),
-    Future(ResourceFuture<T, E>, Arc<PoolInner<T, E>>),
+    Future(ResourceFuture<T, E>, Arc<PoolInternal<T, E>>),
 }
 
 pub struct ResourceResolve<T: Send + 'static, E: 'static>(ResourceResolveType<T, E>);
@@ -43,8 +40,8 @@ impl<T: Send, E> ResourceResolve<T, E> {
 }
 
 impl<T: Send, E> From<(ResourceGuard<T>, Arc<Shared<T>>)> for ResourceResolve<T, E> {
-    fn from((guard, queue): (ResourceGuard<T>, Arc<Shared<T>>)) -> Self {
-        Self(ResourceResolveType::Resource(Some((guard, queue))))
+    fn from((guard, shared): (ResourceGuard<T>, Arc<Shared<T>>)) -> Self {
+        Self(ResourceResolveType::Resource(Some((guard, shared))))
     }
 }
 
@@ -54,8 +51,8 @@ impl<T: Send, E> From<Option<(ResourceGuard<T>, Arc<Shared<T>>)>> for ResourceRe
     }
 }
 
-impl<T: Send, E> From<(ResourceFuture<T, E>, Arc<PoolInner<T, E>>)> for ResourceResolve<T, E> {
-    fn from((fut, exec): (ResourceFuture<T, E>, Arc<PoolInner<T, E>>)) -> Self {
+impl<T: Send, E> From<(ResourceFuture<T, E>, Arc<PoolInternal<T, E>>)> for ResourceResolve<T, E> {
+    fn from((fut, exec): (ResourceFuture<T, E>, Arc<PoolInternal<T, E>>)) -> Self {
         Self(ResourceResolveType::Future(fut, exec))
     }
 }
@@ -68,8 +65,8 @@ impl<T: Send, E> Drop for ResourceResolve<T, E> {
             ResourceResolveType::Future(fut, pool) => {
                 pool.release_future(fut);
             }
-            ResourceResolveType::Resource(Some((res, queue))) => {
-                queue.release(res);
+            ResourceResolveType::Resource(Some((res, shared))) => {
+                shared.release(res);
             }
             ResourceResolveType::Resource(None) => (),
         }
@@ -100,7 +97,7 @@ pub trait ResourceOperation<T: Send, E> {
     fn apply<'a>(
         &self,
         guard: ResourceGuard<T>,
-        pool: &Arc<PoolInner<T, E>>,
+        pool: &Arc<PoolInternal<T, E>>,
     ) -> ResourceResolve<T, E>;
 }
 
@@ -115,7 +112,7 @@ where
     fn apply<'a>(
         &self,
         guard: ResourceGuard<T>,
-        pool: &Arc<PoolInner<T, E>>,
+        pool: &Arc<PoolInternal<T, E>>,
     ) -> ResourceResolve<T, E> {
         ((self.inner)(guard), pool.clone()).into()
     }
@@ -134,7 +131,7 @@ where
             result
                 .and_then(|res| async move {
                     guard.replace(res);
-                    guard.info().created_at.replace(Instant::now());
+                    guard.info_mut().created_at.replace(Instant::now());
                     Ok(guard)
                 })
                 .boxed()
@@ -142,16 +139,16 @@ where
     }
 }
 
-pub fn resource_update<C, F, T, E>(update: C) -> impl ResourceOperation<T, E>
+pub fn resource_verify<C, F, T, E>(update: C) -> impl ResourceOperation<T, E>
 where
-    C: Fn(T, ResourceInfo) -> F + Send + Sync,
+    C: Fn(&mut T, ResourceInfo) -> F + Send + Sync,
     F: TryFuture<Ok = Option<T>, Error = E> + Send + 'static,
     T: Send + 'static,
 {
     ResourceUpdateFn {
         inner: move |mut guard: ResourceGuard<T>| {
-            let res = guard.take().unwrap();
-            let result = update(res, *guard.info());
+            let mut res = guard.take().unwrap();
+            let result = update(&mut res, *guard.info());
             result
                 .and_then(|optres| async move {
                     if let Some(res) = optres {
@@ -160,21 +157,6 @@ where
                     Ok(guard)
                 })
                 .boxed()
-        },
-    }
-}
-
-pub fn resource_dispose<C, F, T, E>(dispose: C) -> impl ResourceOperation<T, E>
-where
-    C: Fn(T, ResourceInfo) -> F + Send + Sync,
-    F: TryFuture<Ok = (), Error = E> + Send + 'static,
-    T: Send + 'static,
-{
-    ResourceUpdateFn {
-        inner: move |mut guard: ResourceGuard<T>| {
-            let res = guard.take().unwrap();
-            let result = dispose(res, *guard.info());
-            result.and_then(|_| async move { Ok(guard) }).boxed()
         },
     }
 }

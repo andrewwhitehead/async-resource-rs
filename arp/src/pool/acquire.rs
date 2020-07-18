@@ -4,8 +4,8 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use super::error::AcquireError;
-use super::Pool;
-use crate::resource::{Managed, ResourceResolve};
+use super::{Pool, ResourceResolve};
+use crate::resource::Managed;
 use crate::wait::Waiter;
 
 enum AcquireState<T: Send + 'static, E: 'static> {
@@ -72,7 +72,7 @@ impl<T: Send, E> Future for Acquire<T, E> {
                     }
                     Poll::Ready(Some(res)) => {
                         let res = res
-                            .map(|guard| Managed::new(guard, self.pool.shared().clone()))
+                            .map(|guard| Managed::new(guard, self.pool.inner.shared().clone()))
                             .map_err(AcquireError::ResourceError);
                         return Poll::Ready(res);
                     }
