@@ -2,7 +2,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use arp_channel::dropshot;
+use crate::util::dropshot;
 pub use dropshot::Canceled;
 
 pub fn waiter_pair<T>() -> (WaitResponder<T>, Waiter<T>) {

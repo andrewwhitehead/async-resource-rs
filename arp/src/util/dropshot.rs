@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 
 use super::option_lock::OptionLock;
-use super::thread_waker::thread_waker;
+use super::thread_waker;
 
 /// Alternative version of futures::oneshot
 /// In this case poll_cancelled is not available. It could be added
@@ -232,8 +232,10 @@ impl<T> Receiver<T> {
             }
         }
         loop {
-            let (waiter, waker) = thread_waker();
-            match self.inner.poll_recv(&mut waker.to_context()) {
+            let (waker, waiter) = thread_waker::pair();
+            let task_waker = waker.task_waker();
+            let mut context = Context::from_waker(&task_waker);
+            match self.inner.poll_recv(&mut context) {
                 Poll::Ready(result) => return result,
                 Poll::Pending => {
                     waiter.wait();

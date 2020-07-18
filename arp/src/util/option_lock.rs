@@ -14,7 +14,7 @@ pub struct OptionLock<T> {
 
 impl<T> Default for OptionLock<T> {
     fn default() -> Self {
-        Self::new(None)
+        Self::empty()
     }
 }
 
@@ -27,6 +27,13 @@ impl<T> OptionLock<T> {
         Self {
             data: UnsafeCell::new(data),
             state: AtomicU8::new(state),
+        }
+    }
+
+    pub const fn empty() -> Self {
+        Self {
+            data: UnsafeCell::new(None),
+            state: AtomicU8::new(NONE),
         }
     }
 

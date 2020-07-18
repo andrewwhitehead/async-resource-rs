@@ -3,13 +3,14 @@ use std::time::Duration;
 use futures_util::future::TryFuture;
 
 use super::{
-    resource_create, resource_verify, DisposeFn, ErrorFn, ReleaseFn, ResourceInfo,
-    ResourceOperation,
+    default_executor, resource_create, resource_verify, DisposeFn, ErrorFn, Executor, ReleaseFn,
+    ResourceInfo, ResourceOperation,
 };
 use super::{Pool, PoolInternal};
 
 pub struct PoolConfig<T: Send, E> {
     acquire_timeout: Option<Duration>,
+    executor: Option<Box<dyn Executor>>,
     handle_error: Option<ErrorFn<E>>,
     idle_timeout: Option<Duration>,
     min_count: usize,
@@ -19,7 +20,6 @@ pub struct PoolConfig<T: Send, E> {
     on_dispose: Option<DisposeFn<T>>,
     on_release: Option<ReleaseFn<T>>,
     on_verify: Option<Box<dyn ResourceOperation<T, E> + Send + Sync>>,
-    thread_count: Option<usize>,
 }
 
 impl<T: Send, E> PoolConfig<T, E> {
@@ -32,6 +32,7 @@ impl<T: Send, E> PoolConfig<T, E> {
     {
         Self {
             acquire_timeout: None,
+            executor: None,
             handle_error: None,
             idle_timeout: None,
             min_count: 0,
@@ -41,7 +42,6 @@ impl<T: Send, E> PoolConfig<T, E> {
             on_dispose: None,
             on_release: None,
             on_verify: None,
-            thread_count: None,
         }
     }
 
@@ -113,19 +113,11 @@ impl<T: Send, E> PoolConfig<T, E> {
         self
     }
 
-    pub fn thread_count(mut self, val: usize) -> Self {
-        if val > 0 {
-            self.thread_count.replace(val);
-        } else {
-            self.thread_count.take();
-        }
-        self
-    }
-
     pub fn build(self) -> Pool<T, E> {
         let inner = PoolInternal::new(
             self.acquire_timeout,
             self.on_create,
+            self.executor.unwrap_or_else(default_executor),
             self.handle_error,
             self.idle_timeout,
             self.min_count,
@@ -133,7 +125,6 @@ impl<T: Send, E> PoolConfig<T, E> {
             self.max_waiters,
             self.on_dispose,
             self.on_release,
-            self.thread_count,
             self.on_verify,
         );
         Pool::new(inner)

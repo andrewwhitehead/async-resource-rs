@@ -5,8 +5,7 @@ use concurrent_queue::ConcurrentQueue;
 
 use super::resource::{ResourceGuard, ResourceInfo, ResourceLock};
 
-mod waker;
-pub use waker::{shared_waker, SharedWaiter, SharedWaker};
+use super::util::thread_waker;
 
 pub type ReleaseFn<T> = Box<dyn Fn(&mut T, ResourceInfo) -> bool + Send + Sync>;
 pub type DisposeFn<T> = Box<dyn Fn(T, ResourceInfo) + Send + Sync>;
@@ -27,7 +26,7 @@ pub struct Shared<T> {
     min_count: usize,
     on_dispose: Option<DisposeFn<T>>,
     on_release: Option<ReleaseFn<T>>,
-    waker: SharedWaker,
+    waker: thread_waker::Waker,
 }
 
 impl<T> Shared<T> {
@@ -37,8 +36,8 @@ impl<T> Shared<T> {
         min_count: usize,
         max_count: usize,
         idle_timeout: Option<Duration>,
-    ) -> (Self, SharedWaiter) {
-        let (waker, waiter) = shared_waker();
+    ) -> (Self, thread_waker::Waiter) {
+        let (waker, waiter) = thread_waker::pair();
         (
             Self {
                 busy: AtomicBool::new(false),

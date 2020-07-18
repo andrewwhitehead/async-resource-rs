@@ -3,10 +3,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use super::error::AcquireError;
-use super::{Pool, ResourceResolve};
+use super::{AcquireError, Pool, ResourceResolve, Waiter};
 use crate::resource::Managed;
-use crate::wait::Waiter;
 
 enum AcquireState<T: Send + 'static, E: 'static> {
     Init,

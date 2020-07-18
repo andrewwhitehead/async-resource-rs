@@ -1,100 +1,111 @@
-use std::future::Future;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread;
+use futures_util::future::BoxFuture;
 
-use async_channel::{unbounded, Receiver, Sender};
-
-use futures_util::future::{BoxFuture, FutureExt};
-
-use super::sentinel::Sentinel;
-
-pub struct Executor {
-    inner: Option<Arc<ExecutorInner>>,
-    panicked: Arc<AtomicBool>,
+pub trait Executor: Send + Sync {
+    fn spawn_ok(&self, task: BoxFuture<'static, ()>);
 }
 
-pub struct ExecutorInner {
-    sender: Sender<BoxFuture<'static, ()>>,
-    workers: Vec<thread::JoinHandle<()>>,
-}
+#[cfg(feature = "exec-multitask")]
+mod exec_multitask {
+    use super::BoxFuture;
+    use super::Executor;
+    use crate::pool::Sentinel;
+    use crate::util::{option_lock::OptionLock, thread_waker};
+    use multitask::Executor as MTExecutor;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::thread;
 
-impl Clone for Executor {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            panicked: self.panicked.clone(),
-        }
-    }
-}
+    const GLOBAL_INST: OptionLock<MultitaskExecutor> = OptionLock::empty();
 
-impl Executor {
-    pub fn new(thread_count: usize) -> Self {
-        let mut workers = vec![];
-        let (sender, receiver) = unbounded();
-        let panicked = Arc::new(AtomicBool::new(false));
-        let sentinel = Sentinel::new(panicked.clone(), |state, _| {
-            if thread::panicking() {
-                state.store(true, Ordering::Relaxed);
-            }
-        });
-        for _ in 0..thread_count {
-            let wk_recv = receiver.clone();
-            let wk_sentinel = sentinel.clone();
-            workers.push(thread::spawn(move || {
-                smol::run(Self::work(wk_recv, wk_sentinel))
-            }));
-        }
-        Self {
-            inner: Some(Arc::new(ExecutorInner { sender, workers })),
-            panicked,
-        }
+    pub struct MultitaskExecutor {
+        inner: Sentinel<(
+            MTExecutor,
+            Vec<(thread::JoinHandle<()>, thread_waker::Waker)>,
+        )>,
     }
 
-    pub fn spawn_ok(&self, fut: impl Future<Output = ()> + Send + 'static) {
-        if self.panicked.load(Ordering::Relaxed) {
-            panic!("Worker thread panicked");
-        }
-        self.inner
-            .as_ref()
-            .unwrap()
-            .sender
-            .try_send(fut.boxed())
-            .expect("error spawning task into executor")
-    }
+    impl MultitaskExecutor {
+        pub fn new(threads: usize) -> Self {
+            assert_ne!(threads, 0);
+            let ex = MTExecutor::new();
+            let running = Arc::new(AtomicBool::new(true));
+            let tickers = (0..threads)
+                .map(|_| {
+                    let (waker, waiter) = thread_waker::pair();
+                    let waker_copy = waker.clone();
+                    let ticker = ex.ticker(move || waker_copy.wake());
+                    let running = running.clone();
+                    (
+                        thread::spawn(move || loop {
+                            if !ticker.tick() {
+                                waiter.prepare_wait();
+                                if !running.load(Ordering::Acquire) {
+                                    println!("shut down thread");
+                                    break;
+                                }
+                                waiter.wait();
+                            }
+                        }),
+                        waker,
+                    )
+                })
+                .collect();
 
-    pub async fn work(receiver: Receiver<BoxFuture<'static, ()>>, sentinel: Sentinel<AtomicBool>) {
-        loop {
-            match receiver.recv().await {
-                Ok(fut) => {
-                    smol::Task::local(fut).await;
-                }
-                Err(_) => {
-                    // exit loop once sender is dropped
-                    drop(sentinel);
-                    break;
-                }
+            Self {
+                inner: Sentinel::new(Arc::new((ex, tickers)), move |inner, count| {
+                    if count == 0 {
+                        println!("shut down exec");
+                        running.store(false, Ordering::Release);
+                        if let Ok((_, threads)) = Arc::try_unwrap(inner) {
+                            for (thread, waker) in threads {
+                                waker.wake();
+                                thread.join().unwrap();
+                            }
+                        } else {
+                            panic!("Error unwrapping executor state")
+                        }
+                    }
+                }),
             }
         }
-    }
-}
 
-impl Drop for Executor {
-    fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            // block on threads if the last instance of the executor
-            if let Ok(ExecutorInner {
-                mut workers,
-                sender,
-            }) = Arc::try_unwrap(inner)
-            {
-                drop(sender);
-                for worker in workers.drain(..) {
-                    worker.join().unwrap()
+        pub fn global() -> Self {
+            loop {
+                if let Some(mut guard) = GLOBAL_INST.try_lock() {
+                    if guard.is_some() {
+                        break guard.as_ref().unwrap().clone();
+                    } else {
+                        let inst = MultitaskExecutor::new(5);
+                        guard.replace(inst.clone());
+                        break inst;
+                    }
                 }
+                thread::yield_now();
             }
         }
     }
+
+    impl Clone for MultitaskExecutor {
+        fn clone(&self) -> Self {
+            Self {
+                inner: self.inner.clone(),
+            }
+        }
+    }
+
+    impl Executor for MultitaskExecutor {
+        fn spawn_ok(&self, task: BoxFuture<'static, ()>) {
+            self.inner.0.spawn(task).detach()
+        }
+    }
+}
+
+#[cfg(feature = "exec-multitask")]
+pub use exec_multitask::MultitaskExecutor;
+
+#[cfg(feature = "exec-multitask")]
+pub fn default_executor() -> Box<dyn Executor> {
+    Box::new(exec_multitask::MultitaskExecutor::global())
 }

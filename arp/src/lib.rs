@@ -1,9 +1,9 @@
 mod pool;
-pub use pool::{Acquire, AcquireError, Pool, PoolConfig, PoolDrain};
+pub use pool::{default_executor, Acquire, AcquireError, Executor, Pool, PoolConfig, PoolDrain};
 
 mod resource;
 pub use resource::Managed;
 
 mod shared;
 
-mod wait;
+pub mod util;

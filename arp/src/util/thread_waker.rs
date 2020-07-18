@@ -4,23 +4,26 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
     Arc,
 };
+use std::task::Waker as TaskWaker;
 use std::thread;
 use std::time::Instant;
+
+use futures_util::task::{waker, ArcWake};
 
 const IDLE: u8 = 0;
 const BUSY: u8 = 1;
 const WAKE: u8 = 2;
 
-pub fn shared_waker() -> (SharedWaker, SharedWaiter) {
+pub fn pair() -> (Waker, Waiter) {
     let inner = Arc::new(Inner {
         state: AtomicU8::new(BUSY),
         thread: UnsafeCell::new(MaybeUninit::uninit()),
     });
     (
-        SharedWaker {
+        Waker {
             inner: inner.clone(),
         },
-        SharedWaiter { inner },
+        Waiter { inner },
     )
 }
 
@@ -29,25 +32,49 @@ struct Inner {
     thread: UnsafeCell<MaybeUninit<thread::Thread>>,
 }
 
-unsafe impl Sync for Inner {}
-
-pub struct SharedWaker {
-    inner: Arc<Inner>,
-}
-
-impl SharedWaker {
-    pub fn wake(&self) {
-        if self.inner.state.swap(BUSY, Ordering::Release) == WAKE {
-            unsafe { self.inner.thread.get().read().assume_init() }.unpark()
+impl Inner {
+    pub fn wake(self: &Arc<Self>) {
+        if self.state.swap(BUSY, Ordering::Release) == WAKE {
+            unsafe { self.thread.get().read().assume_init() }.unpark()
         }
     }
 }
 
-pub struct SharedWaiter {
+impl ArcWake for Inner {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.wake()
+    }
+}
+
+unsafe impl Sync for Inner {}
+
+pub struct Waker {
     inner: Arc<Inner>,
 }
 
-impl SharedWaiter {
+impl Waker {
+    pub fn task_waker(&self) -> TaskWaker {
+        waker(self.inner.clone())
+    }
+
+    pub fn wake(&self) {
+        (&self.inner).wake()
+    }
+}
+
+impl Clone for Waker {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+pub struct Waiter {
+    inner: Arc<Inner>,
+}
+
+impl Waiter {
     pub fn prepare_wait(&self) {
         self.inner.state.store(IDLE, Ordering::Release);
         unsafe {

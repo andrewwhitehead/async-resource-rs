@@ -14,8 +14,8 @@ use concurrent_queue::ConcurrentQueue;
 use futures_util::FutureExt;
 
 use super::resource::{ResourceGuard, ResourceInfo, ResourceLock};
-use super::shared::{DisposeFn, ReleaseFn, Shared, SharedEvent, SharedWaiter};
-use super::wait::{waiter_pair, WaitResponder, Waiter};
+use super::shared::{DisposeFn, ReleaseFn, Shared, SharedEvent};
+use super::util::{sentinel::Sentinel, thread_waker};
 
 mod acquire;
 pub use acquire::Acquire;
@@ -27,15 +27,15 @@ mod error;
 pub use error::AcquireError;
 
 mod executor;
-use executor::Executor;
+pub use executor::{default_executor, Executor};
 
 mod operation;
 use operation::{
     resource_create, resource_verify, ResourceFuture, ResourceOperation, ResourceResolve,
 };
 
-mod sentinel;
-pub use sentinel::Sentinel;
+mod wait;
+use wait::{waiter_pair, WaitResponder, Waiter};
 
 const ACTIVE: u8 = 0;
 const DRAIN: u8 = 1;
@@ -51,10 +51,10 @@ type WaitResource<T, E> = WaitResponder<ResourceResolve<T, E>>;
 pub(crate) struct PoolManageState<T: Send + 'static, E: 'static> {
     acquire_timeout: Option<Duration>,
     create: BoxedOperation<T, E>,
-    executor: Executor,
+    executor: Box<dyn Executor>,
     handle_error: Option<ErrorFn<E>>,
     max_waiters: Option<usize>,
-    shared_waiter: SharedWaiter,
+    shared_waiter: thread_waker::Waiter,
     register_inject: ConcurrentQueue<Register<T, E>>,
     state: AtomicU8,
     verify: Option<BoxedOperation<T, E>>,
@@ -69,6 +69,7 @@ impl<T: Send, E> PoolInternal<T, E> {
     pub fn new(
         acquire_timeout: Option<Duration>,
         create: Box<dyn ResourceOperation<T, E> + Send + Sync>,
+        executor: Box<dyn Executor>,
         handle_error: Option<Box<dyn Fn(E) + Send + Sync>>,
         idle_timeout: Option<Duration>,
         min_count: usize,
@@ -76,10 +77,8 @@ impl<T: Send, E> PoolInternal<T, E> {
         max_waiters: Option<usize>,
         on_dispose: Option<DisposeFn<T>>,
         on_release: Option<ReleaseFn<T>>,
-        thread_count: Option<usize>,
         verify: Option<Box<dyn ResourceOperation<T, E> + Send + Sync>>,
     ) -> Self {
-        let executor = Executor::new(thread_count.unwrap_or(1));
         let (shared, shared_waiter) =
             Shared::new(on_release, on_dispose, min_count, max_count, idle_timeout);
         let manage = PoolManageState {
@@ -312,15 +311,18 @@ impl<T: Send, E> PoolInternal<T, E> {
     pub fn complete_resolve(self: &Arc<Self>, res: ResourceResolve<T, E>) {
         if res.is_pending() {
             let inner = self.clone();
-            self.manage.executor.spawn_ok(res.map(move |res| match res {
-                Some(Ok(res)) => {
-                    inner.shared.release(res);
-                }
-                Some(Err(err)) => {
-                    inner.handle_error(err);
-                }
-                None => (),
-            }))
+            self.manage.executor.spawn_ok(
+                res.map(move |res| match res {
+                    Some(Ok(res)) => {
+                        inner.shared.release(res);
+                    }
+                    Some(Err(err)) => {
+                        inner.handle_error(err);
+                    }
+                    None => (),
+                })
+                .boxed(),
+            )
         }
     }
 
