@@ -48,7 +48,7 @@ fn test_pool_acquire_order_timeout() {
         // with all resources dropped, shutdown should be quick
         drop(fst);
         drop(snd);
-        assert_eq!(pool.shutdown(Duration::from_millis(500)).await, true);
+        pool.drain(Duration::from_millis(500)).await.unwrap();
 
         assert_eq!(disposed.value(), 2);
     })
@@ -58,7 +58,7 @@ fn test_pool_acquire_order_timeout() {
 fn test_pool_acquire_order_no_timeout() {
     let disposed = Arc::new(AtomicCounter::default());
     let dcopy = disposed.clone();
-    let pool = counter_pool_config()
+    let mut pool = counter_pool_config()
         .dispose(move |_res, _| {
             dcopy.increment();
         })
@@ -72,20 +72,20 @@ fn test_pool_acquire_order_no_timeout() {
         drop(snd);
 
         // when there is no idle timeout and the pool is not busy (no waiters)
-        // then 2 should be send to the verify queue and disposed, not returned
-        // to the idle queue
+        // then 2 should be disposed, not returned to the idle queue
         let trd = pool.acquire().await.unwrap();
         assert_eq!(*trd, 3);
 
         drop(fst);
 
-        // shutdown must time out because resource is held, but the event queue
-        // and timers are processed in the meantime, and previous resources should
-        // be disposed of by the manager because there is no idle timeout
-        assert_eq!(pool.shutdown(Duration::from_millis(10)).await, false);
-
         // check the resources we released (1 and 2) have been disposed
         assert_eq!(disposed.value(), 2);
+
+        // shutdown must time out because a resource is held
+        pool = pool.drain(Duration::from_millis(50)).await.unwrap_err();
+
+        drop(trd);
+        pool.drain(Duration::from_millis(500)).await.unwrap();
     });
 }
 

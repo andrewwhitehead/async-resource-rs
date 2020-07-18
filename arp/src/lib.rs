@@ -1,5 +1,5 @@
 mod pool;
-pub use pool::{Acquire, AcquireError, Pool, PoolConfig, PoolShutdown};
+pub use pool::{Acquire, AcquireError, Pool, PoolConfig, PoolDrain};
 
 mod resource;
 pub use resource::Managed;

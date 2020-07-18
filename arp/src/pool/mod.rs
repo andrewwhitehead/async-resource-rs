@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
@@ -37,8 +38,9 @@ mod sentinel;
 pub use sentinel::Sentinel;
 
 const ACTIVE: u8 = 0;
-const SHUTDOWN: u8 = 1;
-const STOPPED: u8 = 2;
+const DRAIN: u8 = 1;
+const SHUTDOWN: u8 = 2;
+const STOPPED: u8 = 3;
 
 type BoxedOperation<T, E> = Box<dyn ResourceOperation<T, E> + Send + Sync>;
 
@@ -127,6 +129,7 @@ impl<T: Send, E> PoolInternal<T, E> {
     }
 
     fn manage(self: Arc<Self>) {
+        let mut drain_count: usize = 0;
         let inner = Sentinel::new(self, |inner, _| {
             // Set the state to Stopped when this thread exits, whether normally
             // or due to a panic.
@@ -143,8 +146,12 @@ impl<T: Send, E> PoolInternal<T, E> {
             let remain_timers = timers.split_off(&(Instant::now(), 0));
             for ((inst, _), timer) in timers {
                 match timer {
-                    Timer::Shutdown(_) => {
-                        // Just drop the shutdown timer to indicate we haven't finished
+                    Timer::Drain(_) => {
+                        // Cancel drain (waiter is notified by dropping it)
+                        drain_count -= 1;
+                        if drain_count == 0 {
+                            inner.stop_drain();
+                        }
                     }
                     Timer::Verify(res) => {
                         if let Some(mut guard) = res.try_lock() {
@@ -205,9 +212,11 @@ impl<T: Send, E> PoolInternal<T, E> {
 
             while let Ok(register) = inner.manage.register_inject.pop() {
                 match register {
-                    Register::Shutdown(expire, notify) => {
+                    Register::Drain(expire, notify) => {
+                        inner.start_drain(false);
                         timer_id_source += 1;
-                        timers.insert((expire, timer_id_source), Timer::Shutdown(notify));
+                        timers.insert((expire, timer_id_source), Timer::Drain(notify));
+                        drain_count += 1;
                     }
                     Register::Waiter(start, waiter) => {
                         if let Some(expire) =
@@ -258,7 +267,7 @@ impl<T: Send, E> PoolInternal<T, E> {
             }
 
             let state = inner.manage.state.load(Ordering::Acquire);
-            if state == SHUTDOWN {
+            if state == DRAIN {
                 for res in repo.iter() {
                     if let Some(guard) = res.try_lock() {
                         inner.shared.dispose(guard);
@@ -288,7 +297,7 @@ impl<T: Send, E> PoolInternal<T, E> {
 
         for (_, timer) in timers {
             match timer {
-                Timer::Shutdown(waiter) => {
+                Timer::Drain(waiter) => {
                     // Send true to indicate that the shutdown succeeded.
                     // Not bothered if the send fails.
                     waiter.send(true).unwrap_or(());
@@ -322,28 +331,37 @@ impl<T: Send, E> PoolInternal<T, E> {
         &self.shared
     }
 
-    pub fn shutdown(self: &Arc<Self>) -> bool {
+    pub fn start_drain(self: &Arc<Self>, shutdown: bool) {
         let mut state = ACTIVE;
+        let next_state = if shutdown { SHUTDOWN } else { DRAIN };
         loop {
             match self.manage.state.compare_exchange_weak(
                 state,
-                SHUTDOWN,
-                Ordering::SeqCst,
+                next_state,
+                Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) | Err(SHUTDOWN) => {
+                Ok(_) => {
                     self.shared.notify();
-                    break true;
                 }
-                Err(STOPPED) => {
-                    break false;
+                Err(DRAIN) if next_state == DRAIN => {
+                    break;
                 }
-                Err(s @ ACTIVE) => {
+                Err(s @ ACTIVE) | Err(s @ DRAIN) => {
                     state = s;
+                }
+                Err(SHUTDOWN) | Err(STOPPED) => {
+                    break;
                 }
                 Err(_) => panic!("Invalid pool state"),
             }
         }
+    }
+
+    pub fn stop_drain(self: &Arc<Self>) {
+        self.manage
+            .state
+            .compare_and_swap(DRAIN, ACTIVE, Ordering::AcqRel);
     }
 
     pub fn try_acquire_idle(self: &Arc<Self>) -> ResourceResolve<T, E> {
@@ -414,7 +432,7 @@ impl<T: Send, E> Pool<T, E> {
         let mgr = inner.clone();
         let sentinel = Sentinel::new(inner, |inner, count| {
             if count == 0 {
-                inner.shutdown();
+                inner.start_drain(true);
             }
         });
         std::thread::spawn(move || mgr.manage());
@@ -429,14 +447,17 @@ impl<T: Send, E> Pool<T, E> {
         self.inner.shared.count()
     }
 
-    pub fn shutdown(self, timeout: Duration) -> PoolShutdown {
+    pub fn drain(self, timeout: Duration) -> PoolDrain<T, E> {
         let (send, receive) = waiter_pair();
         self.inner
             .manage
             .register_inject
-            .push(Register::Shutdown(Instant::now() + timeout, send))
+            .push(Register::Drain(Instant::now() + timeout, send))
             .unwrap_or(());
-        PoolShutdown { receive }
+        PoolDrain {
+            inner: Some(self.inner),
+            receive,
+        }
     }
 }
 
@@ -448,37 +469,60 @@ impl<T: Send, E> Clone for Pool<T, E> {
     }
 }
 
+impl<T: Send, E> Debug for Pool<T, E> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pool")
+            .field("count", &self.count())
+            .finish()
+    }
+}
+
 enum Register<T: Send + 'static, E: 'static> {
-    Shutdown(Instant, WaitResponder<bool>),
+    Drain(Instant, WaitResponder<bool>),
     Waiter(Instant, WaitResource<T, E>),
 }
 
 enum Timer<T: Send + 'static, E: 'static> {
-    Shutdown(WaitResponder<bool>),
+    Drain(WaitResponder<bool>),
     Verify(ResourceLock<T>),
     Waiter(WaitResource<T, E>),
 }
 
-pub struct PoolShutdown {
+pub struct PoolDrain<T: Send + 'static, E: 'static> {
+    inner: Option<Sentinel<PoolInternal<T, E>>>,
     receive: Waiter<bool>,
 }
 
 impl<T: Send + 'static, E: 'static> Timer<T, E> {
     // fn is_canceled(&self) -> bool {
     //     match self {
-    //         Self::Shutdown(ref wait) => wait.is_canceled(),
+    //         Self::Drain(ref wait) => wait.is_canceled(),
     //         Self::Verify(..) => false,
     //         Self::Waiter(ref wait) => wait.is_canceled(),
     //     }
     // }
 }
 
-impl Future for PoolShutdown {
-    type Output = bool;
+impl<T: Send, E> Future for PoolDrain<T, E> {
+    type Output = Result<(), Pool<T, E>>;
+
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut *self.receive)
-            .poll(cx)
-            .map(|result| result.unwrap_or(false))
+        if self.inner.is_none() {
+            return Poll::Ready(Ok(()));
+        }
+
+        match Pin::new(&mut *self.receive).poll(cx) {
+            Poll::Ready(done) => {
+                if done.unwrap_or(false) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Ready(Err(Pool {
+                        inner: self.inner.take().unwrap(),
+                    }))
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

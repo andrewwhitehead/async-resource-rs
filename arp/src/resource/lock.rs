@@ -79,7 +79,13 @@ impl<T> Clone for ResourceLock<T> {
 
 impl<T> Debug for ResourceLock<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "ResourceLock({:p})", &*self.inner)
+        let state = match self.inner.state.load(Ordering::Acquire) {
+            NONE => "None",
+            SOME => "Some",
+            HELD => "Held",
+            _ => "<!>",
+        };
+        write!(f, "ResourceLock({}, {:p})", state, &*self.inner)
     }
 }
 
