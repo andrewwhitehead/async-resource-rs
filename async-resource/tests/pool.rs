@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_executor::block_on;
 
-use arp::PoolConfig;
+use async_resource::PoolConfig;
 
 mod utils;
 use utils::AtomicCounter;

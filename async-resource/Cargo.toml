@@ -1,5 +1,5 @@
 [package]
-name = "arp"
+name = "async-resource"
 version = "0.1.0"
 authors = ["Andrew Whitehead <cywolf@gmail.com>"]
 edition = "2018"
@@ -8,7 +8,7 @@ description = "Async resource pool"
 license = "MIT/Apache-2.0"
 
 [lib]
-name = "arp"
+name = "async_resource"
 path = "src/lib.rs"
 
 [features]
@@ -16,7 +16,6 @@ default = ["exec-multitask"]
 exec-multitask = ["multitask"]
 
 [dependencies]
-arp-channel = { path = "../arp-channel" }
 concurrent-queue = "1.1"
 futures-util = "0.3"
 multitask = { version = "0.2", optional = true }

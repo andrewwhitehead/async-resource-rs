@@ -42,7 +42,6 @@ mod exec_multitask {
                             if !ticker.tick() {
                                 waiter.prepare_wait();
                                 if !running.load(Ordering::Acquire) {
-                                    println!("shut down thread");
                                     break;
                                 }
                                 waiter.wait();
@@ -56,7 +55,6 @@ mod exec_multitask {
             Self {
                 inner: Sentinel::new(Arc::new((ex, tickers)), move |inner, count| {
                     if count == 0 {
-                        println!("shut down exec");
                         running.store(false, Ordering::Release);
                         if let Ok((_, threads)) = Arc::try_unwrap(inner) {
                             for (thread, waker) in threads {
