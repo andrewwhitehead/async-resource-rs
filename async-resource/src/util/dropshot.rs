@@ -53,10 +53,10 @@ struct Inner<T> {
 unsafe impl<T> Sync for Inner<T> {}
 
 impl<T> Inner<T> {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             data: UnsafeCell::new(MaybeUninit::uninit()),
-            recv_waker: OptionLock::new(None),
+            recv_waker: OptionLock::new(),
             state: AtomicU8::new(INIT),
         }
     }

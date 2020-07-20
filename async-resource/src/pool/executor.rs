@@ -17,7 +17,7 @@ mod exec_multitask {
     };
     use std::thread;
 
-    const GLOBAL_INST: OptionLock<MultitaskExecutor> = OptionLock::empty();
+    const GLOBAL_INST: OptionLock<MultitaskExecutor> = OptionLock::new();
 
     pub struct MultitaskExecutor {
         inner: Sentinel<(
@@ -71,15 +71,14 @@ mod exec_multitask {
 
         pub fn global() -> Self {
             loop {
-                if let Some(mut guard) = GLOBAL_INST.try_lock() {
-                    if guard.is_some() {
-                        break guard.as_ref().unwrap().clone();
-                    } else {
-                        let inst = MultitaskExecutor::new(5);
-                        guard.replace(inst.clone());
-                        break inst;
-                    }
+                if let Ok(read) = GLOBAL_INST.read() {
+                    break read.clone();
+                } else if let Some(mut guard) = GLOBAL_INST.try_lock() {
+                    let inst = MultitaskExecutor::new(5);
+                    guard.replace(inst.clone());
+                    break inst;
                 }
+                // wait for the other thread to populate the instance
                 thread::yield_now();
             }
         }
