@@ -1,12 +1,45 @@
-use std::cell::UnsafeCell;
-use std::fmt::{self, Debug, Display, Formatter};
-use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicUsize, Ordering};
+//! This crate defines a locking structure wrapping an Option value, which
+//! uses only atomic operations to allow a single exclusive write lock or
+//! a series of concurrent read locks on the contained data.
+//!
+//! This structure allows for multiple usage patterns. It can be used to
+//! implement a version of `once_cell` / `lazy_static`:
+//!
+//! ```
+//! use option_lock::{OptionLock, OptionRead};
+//! use std::collections::HashMap;
+//!
+//! static REPOSITORY: OptionLock<HashMap<String, u32>> = OptionLock::new();
+//!
+//! pub fn resource_map() -> OptionRead<'static, HashMap<String, u32>> {
+//!   loop {
+//!     if let Ok(read) = REPOSITORY.read() {
+//!       break read;
+//!     } else if let Ok(mut guard) = REPOSITORY.try_lock() {
+//!       let mut inst = HashMap::new();
+//!       inst.insert("hello".to_string(), 5);
+//!       guard.replace(inst);
+//!       break REPOSITORY.downgrade(guard).unwrap();
+//!     } else {
+//!       // wait while the resource is created
+//!       std::thread::yield_now();
+//!     }
+//!   }
+//! }
+//!
+//! assert_eq!(*resource_map().get("hello").unwrap(), 5);
+//! ```
 
-const SOME: usize = 1;
-const FREE: usize = 2;
+use core::cell::UnsafeCell;
+use core::fmt::{self, Debug, Display, Formatter};
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+const SOME: usize = 0x1;
+const FREE: usize = 0x2;
 const SHIFT: usize = 2;
 
+/// A read-
 pub struct OptionLock<T> {
     data: UnsafeCell<Option<T>>,
     state: AtomicUsize,
@@ -25,6 +58,9 @@ pub enum ReadError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct TryLockError;
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum Status {
     ExclusiveLock,
     None,
@@ -33,6 +69,19 @@ pub enum Status {
 }
 
 impl Status {
+    #[inline]
+    pub(crate) fn new(val: usize) -> Self {
+        if val & !SOME == 0 {
+            Self::ExclusiveLock
+        } else if val == FREE {
+            Self::None
+        } else if val == FREE | SOME {
+            Self::Some
+        } else {
+            Self::ReadLock(val >> SHIFT)
+        }
+    }
+
     pub fn is_locked(&self) -> bool {
         matches!(self, Self::ExclusiveLock)
     }
@@ -65,6 +114,19 @@ impl<T> OptionLock<T> {
         }
     }
 
+    pub fn downgrade<'a>(&self, guard: OptionGuard<'a, T>) -> Option<OptionRead<'_, T>> {
+        assert!(std::ptr::eq(guard.lock, self));
+
+        if guard.is_some() {
+            self.state
+                .store((1 << SHIFT) | FREE | SOME, Ordering::Release);
+            std::mem::forget(guard);
+            Some(OptionRead { lock: &self })
+        } else {
+            None
+        }
+    }
+
     pub unsafe fn get_unchecked(&self) -> &mut Option<T> {
         &mut *self.data.get()
     }
@@ -90,23 +152,15 @@ impl<T> OptionLock<T> {
     }
 
     pub fn status(&self) -> Status {
-        let state = self.state.load(Ordering::Acquire);
-        if state & !SOME == 0 {
-            Status::ExclusiveLock
-        } else if state == FREE {
-            Status::None
-        } else if state == FREE | SOME {
-            Status::Some
-        } else {
-            Status::ReadLock(state >> SHIFT)
-        }
+        Status::new(self.state.load(Ordering::Acquire))
     }
 
-    pub fn try_lock(&self) -> Option<OptionGuard<'_, T>> {
-        if self.state.fetch_and(!FREE, Ordering::AcqRel) & !SOME == FREE {
-            Some(OptionGuard { lock: self })
+    pub fn try_lock(&self) -> Result<OptionGuard<'_, T>, TryLockError> {
+        let state = self.state.fetch_and(!FREE, Ordering::AcqRel);
+        if state & FREE == FREE && (state & SOME == 0 || state >> SHIFT == 0) {
+            Ok(OptionGuard { lock: self })
         } else {
-            None
+            Err(TryLockError)
         }
     }
 
@@ -120,10 +174,12 @@ impl<T> OptionLock<T> {
         }
     }
 
-    pub fn upgrade_lock<'a>(
+    pub fn try_upgrade<'a>(
         &self,
         read: OptionRead<'a, T>,
     ) -> Result<OptionGuard<'_, T>, OptionRead<'a, T>> {
+        assert!(std::ptr::eq(read.lock, self));
+
         let mut state = (1 << SHIFT) | FREE | SOME;
         loop {
             match self
@@ -264,117 +320,3 @@ impl<T> PartialEq for OptionGuard<'_, T> {
 }
 
 impl<T> Eq for OptionGuard<'_, T> {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn option_lock_exclusive() {
-        let a = OptionLock::from(1);
-        assert!(!a.status().is_locked());
-        let mut guard = a.try_lock().unwrap();
-        assert!(a.status().is_locked());
-        assert_eq!(a.try_lock(), None);
-        assert_eq!(a.try_take(), None);
-        assert_eq!(a.read(), Err(ReadError::Locked));
-
-        assert_eq!(*guard, Some(1));
-        guard.replace(2);
-        drop(guard);
-        assert_eq!(*a.try_lock().unwrap(), Some(2));
-        assert!(!a.status().is_locked());
-    }
-
-    #[test]
-    fn option_lock_read() {
-        let a = OptionLock::from(99);
-        assert_eq!(a.status(), Status::Some);
-        assert!(!a.status().is_locked());
-        assert!(a.status().is_some());
-        assert_eq!(a.status().readers(), 0);
-
-        let read = a.read().unwrap();
-        assert_eq!(a.status(), Status::ReadLock(1));
-        assert!(!a.status().is_locked());
-        assert!(a.status().is_some());
-        assert_eq!(a.status().readers(), 1);
-        assert_eq!(*read, 99);
-
-        assert_eq!(a.try_lock(), None);
-        assert_eq!(a.try_take(), None);
-
-        let read2 = a.read().unwrap();
-        assert_eq!(a.status(), Status::ReadLock(2));
-        assert!(!a.status().is_locked());
-        assert!(a.status().is_some());
-        assert_eq!(a.status().readers(), 2);
-        assert_eq!(*read2, 99);
-
-        drop(read2);
-        assert_eq!(a.status().readers(), 1);
-
-        drop(read);
-        assert_eq!(a.status(), Status::Some);
-
-        assert_eq!(a.try_take(), Some(99));
-        assert_eq!(a.status(), Status::None);
-        assert_eq!(a.read(), Err(ReadError::Empty));
-    }
-
-    #[test]
-    fn option_lock_read_upgrade() {
-        let a = OptionLock::from(61);
-        let read = a.read().unwrap();
-        let write = a.upgrade_lock(read).unwrap();
-        assert!(a.status().is_locked());
-        drop(write);
-        assert_eq!(a.status(), Status::Some);
-        drop(a);
-
-        let b = OptionLock::from(5);
-        let read1 = b.read().unwrap();
-        let read2 = b.read().unwrap();
-        assert_eq!(b.status().readers(), 2);
-        let read3 = b.upgrade_lock(read1).unwrap_err();
-        assert!(!b.status().is_locked());
-        assert_eq!(b.status().readers(), 2);
-        drop(read3);
-        assert_eq!(b.status().readers(), 1);
-        drop(read2);
-        assert_eq!(b.status(), Status::Some);
-    }
-
-    #[test]
-    fn option_lock_debug() {
-        assert_eq!(
-            format!("{:?}", &OptionLock::<i32>::new()),
-            "OptionLock { status: None }"
-        );
-        assert_eq!(
-            format!("{:?}", &OptionLock::from(1)),
-            "OptionLock { status: Some }"
-        );
-
-        let lock = OptionLock::from(1);
-        let read = lock.read().unwrap();
-        assert_eq!(format!("{:?}", &read), "1");
-        assert_eq!(
-            format!("{:#?}", &read).replace('\n', "").replace(' ', ""),
-            "OptionRead(1,)"
-        );
-        assert_eq!(format!("{:?}", &lock), "OptionLock { status: ReadLock(1) }");
-        drop(read);
-
-        let guard = lock.try_lock().unwrap();
-        assert_eq!(format!("{:?}", &guard), "Some(1)");
-        assert_eq!(
-            format!("{:#?}", &guard).replace('\n', "").replace(' ', ""),
-            "OptionGuard(Some(1,),)"
-        );
-        assert_eq!(
-            format!("{:?}", &lock),
-            "OptionLock { status: ExclusiveLock }"
-        );
-    }
-}

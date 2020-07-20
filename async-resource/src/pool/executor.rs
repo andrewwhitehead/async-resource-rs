@@ -9,8 +9,9 @@ mod exec_multitask {
     use super::BoxFuture;
     use super::Executor;
     use crate::pool::Sentinel;
-    use crate::util::{option_lock::OptionLock, thread_waker};
+    use crate::util::thread_waker;
     use multitask::Executor as MTExecutor;
+    use option_lock::OptionLock;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -73,7 +74,7 @@ mod exec_multitask {
             loop {
                 if let Ok(read) = GLOBAL_INST.read() {
                     break read.clone();
-                } else if let Some(mut guard) = GLOBAL_INST.try_lock() {
+                } else if let Ok(mut guard) = GLOBAL_INST.try_lock() {
                     let inst = MultitaskExecutor::new(5);
                     guard.replace(inst.clone());
                     break inst;

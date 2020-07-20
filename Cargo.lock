@@ -10,6 +10,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "multitask",
+ "option-lock",
 ]
 
 [[package]]
@@ -409,6 +410,13 @@ name = "oorandom"
 version = "11.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a170cebd8021a008ea92e4db85a72f80b35df514ec664b296fdcbb654eac0b2c"
+
+[[package]]
+name = "option-lock"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+]
 
 [[package]]
 name = "pin-project"

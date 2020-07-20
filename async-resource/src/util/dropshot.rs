@@ -10,7 +10,8 @@ use std::sync::{
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
-use super::option_lock::OptionLock;
+use option_lock::OptionLock;
+
 use super::thread_waker;
 
 /// Alternative version of futures::oneshot
@@ -89,14 +90,12 @@ impl<T> Inner<T> {
                 Ok(Some(val)) => return Poll::Ready(Ok(val)),
                 Ok(None) => {
                     let waker = cx.waker().clone();
-                    match self.recv_waker.try_lock() {
-                        Some(mut guard) => {
-                            guard.replace(waker);
-                        }
-                        None => {
-                            // the sender is already trying to wake us
-                            continue;
-                        }
+                    if let Ok(mut guard) = self.recv_waker.try_lock() {
+                        guard.replace(waker);
+                    } else {
+                        // the sender is already trying to wake us, so the
+                        // value has been stored
+                        continue;
                     }
 
                     // check the state again, in case the sender
