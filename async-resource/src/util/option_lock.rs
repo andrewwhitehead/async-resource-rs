@@ -1,4 +1,3 @@
-/// Copy of simple Lock used by futures::oneshot
 use std::cell::UnsafeCell;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::{Deref, DerefMut};
@@ -13,7 +12,7 @@ pub struct OptionLock<T> {
     state: AtomicUsize,
 }
 
-impl<T> Default for OptionLock<T> {
+impl<T: Default> Default for OptionLock<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -70,6 +69,10 @@ impl<T> OptionLock<T> {
         &mut *self.data.get()
     }
 
+    pub fn get_mut(&mut self) -> &mut Option<T> {
+        unsafe { self.get_unchecked() }
+    }
+
     pub fn into_inner(self) -> Option<T> {
         self.data.into_inner()
     }
@@ -88,7 +91,6 @@ impl<T> OptionLock<T> {
 
     pub fn status(&self) -> Status {
         let state = self.state.load(Ordering::Acquire);
-        println!("state: {}", state);
         if state & !SOME == 0 {
             Status::ExclusiveLock
         } else if state == FREE {
@@ -158,6 +160,14 @@ impl<T> From<Option<T>> for OptionLock<T> {
             data: UnsafeCell::new(data),
             state: AtomicUsize::new(state),
         }
+    }
+}
+
+impl<T> Debug for OptionLock<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OptionLock")
+            .field("status", &self.status())
+            .finish()
     }
 }
 
@@ -333,5 +343,38 @@ mod tests {
         assert_eq!(b.status().readers(), 1);
         drop(read2);
         assert_eq!(b.status(), Status::Some);
+    }
+
+    #[test]
+    fn option_lock_debug() {
+        assert_eq!(
+            format!("{:?}", &OptionLock::<i32>::new()),
+            "OptionLock { status: None }"
+        );
+        assert_eq!(
+            format!("{:?}", &OptionLock::from(1)),
+            "OptionLock { status: Some }"
+        );
+
+        let lock = OptionLock::from(1);
+        let read = lock.read().unwrap();
+        assert_eq!(format!("{:?}", &read), "1");
+        assert_eq!(
+            format!("{:#?}", &read).replace('\n', "").replace(' ', ""),
+            "OptionRead(1,)"
+        );
+        assert_eq!(format!("{:?}", &lock), "OptionLock { status: ReadLock(1) }");
+        drop(read);
+
+        let guard = lock.try_lock().unwrap();
+        assert_eq!(format!("{:?}", &guard), "Some(1)");
+        assert_eq!(
+            format!("{:#?}", &guard).replace('\n', "").replace(' ', ""),
+            "OptionGuard(Some(1,),)"
+        );
+        assert_eq!(
+            format!("{:?}", &lock),
+            "OptionLock { status: ExclusiveLock }"
+        );
     }
 }
