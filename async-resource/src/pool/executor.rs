@@ -11,7 +11,7 @@ mod exec_multitask {
     use crate::pool::Sentinel;
     use crate::util::thread_waker;
     use multitask::Executor as MTExecutor;
-    use option_lock::OptionLock;
+    use option_lock::{self, OptionLock};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -72,15 +72,19 @@ mod exec_multitask {
 
         pub fn global() -> Self {
             loop {
-                if let Ok(read) = GLOBAL_INST.read() {
-                    break read.clone();
-                } else if let Ok(mut guard) = GLOBAL_INST.try_lock() {
-                    let inst = MultitaskExecutor::new(5);
-                    guard.replace(inst.clone());
-                    break inst;
+                match GLOBAL_INST.try_read() {
+                    Ok(read) => break read.clone(),
+                    Err(option_lock::ReadError::Empty) => {
+                        if let Ok(mut guard) = GLOBAL_INST.try_lock() {
+                            let inst = Self::new(5);
+                            guard.replace(inst.clone());
+                            break inst;
+                        }
+                    }
+                    Err(_) => {}
                 }
-                // wait for the other thread to populate the instance
-                thread::yield_now();
+                // wait for another thread to populate the instance
+                std::thread::yield_now();
             }
         }
     }

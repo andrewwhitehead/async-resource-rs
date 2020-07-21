@@ -71,7 +71,7 @@ impl<T> Inner<T> {
 
     pub fn cancel_send(&self) -> bool {
         if self.state.compare_and_swap(INIT, CANCEL, Ordering::SeqCst) == INIT {
-            if let Some(waker) = self.recv_waker.try_take() {
+            if let Ok(waker) = self.recv_waker.try_take() {
                 waker.wake();
             }
             true
@@ -178,7 +178,7 @@ impl<T> Inner<T> {
                         Ordering::Acquire,
                     ) {
                         Ok(_) => {
-                            if let Some(waker) = self.recv_waker.try_take() {
+                            if let Ok(waker) = self.recv_waker.try_take() {
                                 waker.wake();
                             }
                             return Ok(());
