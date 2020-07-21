@@ -76,17 +76,18 @@ mod exec_multitask {
             loop {
                 match GLOBAL_INST.try_read() {
                     Ok(read) => break read.clone(),
-                    Err(option_lock::ReadError::Empty) => {
+                    Err(option_lock::TryReadError::Empty) => {
                         if let Ok(mut guard) = GLOBAL_INST.try_lock() {
                             let inst = Self::new(5);
                             guard.replace(inst.clone());
                             break inst;
                         }
                     }
-                    Err(_) => {}
+                    Err(option_lock::TryReadError::Locked) => {
+                        // wait for another thread to populate the instance
+                        std::thread::yield_now();
+                    }
                 }
-                // wait for another thread to populate the instance
-                std::thread::yield_now();
             }
         }
     }

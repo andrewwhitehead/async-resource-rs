@@ -7,8 +7,8 @@ fn option_lock_exclusive() {
     let mut guard = a.try_lock().unwrap();
     assert!(a.status().is_locked());
     assert!(a.try_lock().is_err());
-    assert_eq!(a.try_take(), Err(ReadError::Locked));
-    assert_eq!(a.try_read(), Err(ReadError::Locked));
+    assert_eq!(a.try_take(), Err(TryReadError::Locked));
+    assert_eq!(a.try_read(), Err(TryReadError::Locked));
 
     assert_eq!(*guard, Some(1));
     guard.replace(2);
@@ -35,7 +35,7 @@ fn option_lock_read() {
     assert_eq!(*read, 99);
 
     assert!(a.try_lock().is_err());
-    assert_eq!(a.try_take(), Err(ReadError::Locked));
+    assert_eq!(a.try_take(), Err(TryReadError::Locked));
 
     let read2 = a.try_read().unwrap();
     assert_eq!(a.status(), Status::ReadLock(2));
@@ -53,14 +53,14 @@ fn option_lock_read() {
 
     assert_eq!(a.try_take(), Ok(99));
     assert_eq!(a.status(), Status::Empty);
-    assert_eq!(a.try_read(), Err(ReadError::Empty));
+    assert_eq!(a.try_read(), Err(TryReadError::Empty));
 }
 
 #[test]
 fn option_lock_read_write() {
     // test a successful write after a failed read
     let a = OptionLock::new();
-    assert_eq!(a.try_read(), Err(ReadError::Empty));
+    assert_eq!(a.try_read(), Err(TryReadError::Empty));
     let mut write = a.try_lock().unwrap();
     write.replace(5);
     drop(write);
@@ -91,16 +91,16 @@ fn option_lock_upgrade() {
 }
 
 #[test]
-fn option_lock_downgrade() {
+fn option_lock_guard_to_read() {
     let a = OptionLock::<u32>::new();
     let write = a.try_lock().unwrap();
-    assert_eq!(OptionGuard::downgrade(write), None);
+    assert_eq!(OptionGuard::into_read(write), None);
     drop(a);
 
     let b = OptionLock::new();
     let mut write = b.try_lock().unwrap();
     write.replace(20);
-    let read = OptionGuard::downgrade(write).unwrap();
+    let read = OptionGuard::into_read(write).unwrap();
     assert_eq!(b.status(), Status::ReadLock(1));
     assert_eq!(*read, 20);
     drop(read);
@@ -110,7 +110,7 @@ fn option_lock_downgrade() {
 #[test]
 fn option_lock_take() {
     let a = OptionLock::<u32>::new();
-    assert_eq!(a.try_take(), Err(ReadError::Empty));
+    assert_eq!(a.try_take(), Err(TryReadError::Empty));
     drop(a);
 
     let b = OptionLock::from(101);

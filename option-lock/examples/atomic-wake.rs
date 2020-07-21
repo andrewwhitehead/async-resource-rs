@@ -34,7 +34,7 @@ impl<T, E> AsyncResult<T, E> {
     }
 
     pub fn fulfill(&self, result: Result<T, E>) -> Result<(), Result<T, E>> {
-        // retry method is left up to the caller
+        // retry method is left up to the caller (spin, yield thread, etc)
         if let Ok(mut guard) = self.state.try_lock() {
             let prev = guard.replace(ResultState::Ready(result));
             drop(guard);

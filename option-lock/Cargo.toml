@@ -1,6 +1,6 @@
 [package]
 name = "option-lock"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Andrew Whitehead <cywolf@gmail.com>"]
 edition = "2018"
 description = "A multi-purpose read/write lock for Option values"

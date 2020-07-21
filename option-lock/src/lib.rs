@@ -10,7 +10,7 @@
 //! be used to implement a version of `once_cell` / `lazy_static`:
 //!
 //! ```
-//! use option_lock::{OptionLock, OptionGuard, OptionRead, ReadError};
+//! use option_lock::{OptionLock, OptionGuard, OptionRead, TryReadError};
 //! use std::collections::HashMap;
 //!
 //! static REPOSITORY: OptionLock<HashMap<String, u32>> = OptionLock::new();
@@ -19,18 +19,19 @@
 //!   loop {
 //!     match REPOSITORY.try_read() {
 //!       Ok(read) => break read,
-//!       Err(ReadError::Empty) => {
+//!       Err(TryReadError::Empty) => {
 //!         if let Ok(mut guard) = REPOSITORY.try_lock() {
 //!           let mut inst = HashMap::new();
 //!           inst.insert("hello".to_string(), 5);
 //!           guard.replace(inst);
-//!           break OptionGuard::downgrade(guard).unwrap();
+//!           break OptionGuard::into_read(guard).unwrap();
 //!         }
 //!       }
-//!       Err(_) => {}
+//!       Err(TryReadError::Locked) => {
+//!          // wait while the resource is created
+//!          std::thread::yield_now();
+//!        }
 //!     }
-//!     // wait while the resource is created
-//!     std::thread::yield_now();
 //!   }
 //! }
 //!
@@ -55,7 +56,7 @@ const FREE: usize = 0x2;
 const AVAILABLE: usize = FREE | SOME;
 const SHIFT: usize = 2;
 
-/// A read-write lock around an Option value
+/// A read/write lock around an Option value.
 pub struct OptionLock<T> {
     data: UnsafeCell<Option<T>>,
     state: AtomicUsize,
@@ -67,28 +68,28 @@ impl<T: Default> Default for OptionLock<T> {
     }
 }
 
-/// An error which may be thrown by [`OptionLock::read`]
+/// The error result of [`OptionLock::try_read`] and [`OptionLock::try_take`].
 #[derive(Debug, PartialEq, Eq)]
-pub enum ReadError {
+pub enum TryReadError {
     Empty,
     Locked,
 }
 
-impl ReadError {
-    /// Check if the read/take operation failed because there was no stored
-    /// value
+impl TryReadError {
+    /// Check if the read or take operation failed because there was no stored
+    /// value.
     pub fn is_empty(&self) -> bool {
         matches!(self, Self::Empty)
     }
 
-    /// Check if the read/take operation failed because the lock was held by
-    /// a competing guard
+    /// Check if the read or take operation failed because the lock was held by
+    /// a competing guard.
     pub fn is_locked(&self) -> bool {
         matches!(self, Self::Locked)
     }
 }
 
-impl Display for ReadError {
+impl Display for TryReadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => write!(f, "OptionLock is empty"),
@@ -98,11 +99,14 @@ impl Display for ReadError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for ReadError {}
+impl std::error::Error for TryReadError {}
 
-/// An error which may be thrown by [`OptionLock::try_lock`]
+/// The error result of [`OptionLock::try_lock`]
 #[derive(Debug, PartialEq, Eq)]
-pub struct TryLockError;
+pub enum TryLockError {
+    /// The `OptionLock` is acquired exclusively or by one or more readers.
+    Contended,
+}
 
 impl Display for TryLockError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -116,9 +120,14 @@ impl std::error::Error for TryLockError {}
 /// The result of [`OptionLock::status`]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Status {
+    /// The `OptionLock` contains a value and is not currently acquired.
     Available,
+    /// The `OptionLock` does not contain a value  and is not currently
+    /// acquired.
     Empty,
+    /// The `OptionLock` is exclusively acquired.
     ExclusiveLock,
+    /// The `OptionLock` is acquired by one or more readers.
     ReadLock(usize),
 }
 
@@ -135,27 +144,27 @@ impl Status {
         }
     }
 
-    /// Check if the lock has a stored value that can be safely read
+    /// Check if the lock has a stored value that can be safely read.
     pub fn can_read(&self) -> bool {
         matches!(self, Self::Available | Self::ReadLock(..))
     }
 
-    /// Check if the lock has a stored value that can be safely removed
+    /// Check if the lock has a stored value that can be safely removed.
     pub fn can_take(&self) -> bool {
         matches!(self, Self::Available)
     }
 
-    /// Check if the lock is free and has no stored value
+    /// Check if the lock is free and has no stored value.
     pub fn is_empty(&self) -> bool {
         matches!(self, Self::Empty)
     }
 
-    /// Check if an exclusive lock has been taken
+    /// Check if an exclusive lock has been taken.
     pub fn is_locked(&self) -> bool {
         matches!(self, Self::ExclusiveLock)
     }
 
-    /// Check the number of concurrent read guards
+    /// Fetch the number of concurrent read guards.
     pub fn readers(&self) -> usize {
         if let Self::ReadLock(count) = self {
             *count
@@ -177,13 +186,13 @@ impl<T> OptionLock<T> {
         }
     }
 
-    /// Get an unsafe, mutable reference to the contained Option.
+    /// Get an unsafe mutable reference to the contained Option.
     pub unsafe fn get_unchecked(&self) -> &mut Option<T> {
         &mut *self.data.get()
     }
 
-    /// Get a safe mutable reference to the contained Option when holding the
-    /// lock instance exclusively.
+    /// Safely get a mutable reference to the contained Option from a
+    /// mutable reference to the lock instance.
     pub fn get_mut(&mut self) -> &mut Option<T> {
         unsafe { self.get_unchecked() }
     }
@@ -201,6 +210,19 @@ impl<T> OptionLock<T> {
             }
             // use a relaxed check in spin loop
             while self.status().is_locked() {
+                spin_loop_hint();
+            }
+        }
+    }
+
+    /// In a spin loop, wait to read a value from the lock.
+    pub fn spin_read(&self) -> OptionRead<'_, T> {
+        loop {
+            if let Ok(guard) = self.try_read() {
+                break guard;
+            }
+            // use a relaxed check in spin loop
+            while self.status().can_read() {
                 spin_loop_hint();
             }
         }
@@ -225,30 +247,56 @@ impl<T> OptionLock<T> {
     }
 
     /// Try to acquire an exclusive lock.
+    ///
+    /// # Return values
+    ///
+    /// On successful acquisition an `OptionGuard` is returned, representing an
+    /// exclusive, read/write lock on the contaned data.
+    ///
+    /// On failure, a `TryLockError` is returned representing the failure state.
+    /// Acquisition can fail if the lock is held exclusively or by one or more
+    /// readers.
     pub fn try_lock(&self) -> Result<OptionGuard<'_, T>, TryLockError> {
         let state = self.state.fetch_and(!FREE, Ordering::AcqRel);
         if state & FREE == FREE && (state & SOME == 0 || state >> SHIFT == 0) {
             Ok(OptionGuard { lock: self })
         } else {
-            Err(TryLockError)
+            Err(TryLockError::Contended)
         }
     }
 
     /// Try to acquire a read-only lock.
-    pub fn try_read(&self) -> Result<OptionRead<'_, T>, ReadError> {
+    ///
+    /// # Return values
+    ///
+    /// On successful acquisition an `OptionRead` is returned, which
+    /// dereferences to the contained value.
+    ///
+    /// On failure, a `TryReadError` is returned representing the failure state.
+    /// Acquisition can fail either because there is no contained value
+    /// or because the lock is held exclusively.
+    pub fn try_read(&self) -> Result<OptionRead<'_, T>, TryReadError> {
         let state = self.state.fetch_add(1 << SHIFT, Ordering::AcqRel);
         if state == AVAILABLE || (state & SOME == SOME && state >> SHIFT != 0) {
             // first reader or subsequent reader
             Ok(OptionRead { lock: self })
         } else if state >> 1 == 0 {
-            Err(ReadError::Locked)
+            Err(TryReadError::Locked)
         } else {
-            Err(ReadError::Empty)
+            Err(TryReadError::Empty)
         }
     }
 
     /// Try to take a stored value from the lock.
-    pub fn try_take(&self) -> Result<T, ReadError> {
+    ///
+    /// # Return values
+    ///
+    /// On successful acquisition the contained `T` value is returned.
+    ///
+    /// On failure, a `TryReadError` is returned representing the failure state.
+    /// Acquisition can fail either because there is no contained value,
+    /// or because the lock is held exclusively or by one or more readers.
+    pub fn try_take(&self) -> Result<T, TryReadError> {
         loop {
             match self.state.compare_exchange_weak(
                 AVAILABLE,
@@ -260,8 +308,8 @@ impl<T> OptionLock<T> {
                 Err(AVAILABLE) => {
                     // retry
                 }
-                Err(state) if state & AVAILABLE == FREE => break Err(ReadError::Empty),
-                Err(_) => break Err(ReadError::Locked),
+                Err(state) if state & AVAILABLE == FREE => break Err(TryReadError::Empty),
+                Err(_) => break Err(TryReadError::Locked),
             }
         }
     }
@@ -362,7 +410,8 @@ impl<T> Drop for OptionRead<'_, T> {
     fn drop(&mut self) {
         let prev = self.lock.state.fetch_sub(1 << SHIFT, Ordering::AcqRel);
         if prev == 1 << SHIFT | SOME {
-            // another process tried to take a write lock and failed, so try to restore FREE flag
+            // we were the last reader. another process tried to take an
+            // exclusive lock and failed, so try to restore FREE flag.
             self.lock
                 .state
                 .compare_exchange(SOME, AVAILABLE, Ordering::AcqRel, Ordering::Relaxed)
@@ -386,7 +435,7 @@ pub struct OptionGuard<'a, T> {
 
 impl<T> OptionGuard<'_, T> {
     /// Downgrade a write guard to a read guard.
-    pub fn downgrade<'a>(guard: OptionGuard<'a, T>) -> Option<OptionRead<'_, T>> {
+    pub fn into_read<'a>(guard: OptionGuard<'a, T>) -> Option<OptionRead<'_, T>> {
         if guard.is_some() {
             guard
                 .lock
