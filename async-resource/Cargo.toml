@@ -14,8 +14,9 @@ name = "async_resource"
 path = "src/lib.rs"
 
 [features]
-default = ["exec-multitask"]
-exec-multitask = ["multitask"]
+default = ["default-exec"]
+default-exec = ["multitask-exec"]
+multitask-exec = ["multitask"]
 
 [dependencies]
 concurrent-queue = "1.1"
@@ -25,5 +26,4 @@ option-lock = { version = "0.1", path = "../option-lock" }
 
 [dev-dependencies]
 criterion = "0.3"
-futures-channel = "0.3"  # temp for bench only
 futures-executor = "0.3"

@@ -24,7 +24,7 @@ mod config;
 pub use config::PoolConfig;
 
 mod error;
-pub use error::AcquireError;
+pub use error::{AcquireError, ConfigError};
 
 mod executor;
 pub use executor::{default_executor, Executor};

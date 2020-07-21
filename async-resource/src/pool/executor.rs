@@ -1,10 +1,12 @@
 use futures_util::future::BoxFuture;
 
+use super::error::ConfigError;
+
 pub trait Executor: Send + Sync {
     fn spawn_ok(&self, task: BoxFuture<'static, ()>);
 }
 
-#[cfg(feature = "exec-multitask")]
+#[cfg(feature = "multitask-exec")]
 mod exec_multitask {
     use super::BoxFuture;
     use super::Executor;
@@ -104,10 +106,15 @@ mod exec_multitask {
     }
 }
 
-#[cfg(feature = "exec-multitask")]
+#[cfg(feature = "multitask-exec")]
 pub use exec_multitask::MultitaskExecutor;
 
-#[cfg(feature = "exec-multitask")]
-pub fn default_executor() -> Box<dyn Executor> {
-    Box::new(exec_multitask::MultitaskExecutor::global())
+#[cfg(feature = "multitask-exec")]
+pub fn default_executor() -> Result<Box<dyn Executor>, ConfigError> {
+    Ok(Box::new(exec_multitask::MultitaskExecutor::global()))
+}
+
+#[cfg(not(any(feature = "multitask-exec")))]
+pub fn default_executor() -> Result<Box<dyn Executor>, ConfigError> {
+    Err(ConfigError("No default executor is provided"))
 }

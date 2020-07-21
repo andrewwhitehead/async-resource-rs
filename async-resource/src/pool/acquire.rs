@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -28,7 +29,7 @@ impl<T: Send, E> Acquire<T, E> {
     }
 }
 
-impl<T: Send, E> Future for Acquire<T, E> {
+impl<T: Send, E: Debug> Future for Acquire<T, E> {
     type Output = Result<Managed<T>, AcquireError<E>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -36,7 +37,7 @@ impl<T: Send, E> Future for Acquire<T, E> {
             Some(state) => state,
             None => {
                 // future already completed
-                return Poll::Ready(Err(AcquireError::Stopped));
+                return Poll::Ready(Err(AcquireError::Closed));
             }
         };
 

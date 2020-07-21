@@ -27,7 +27,8 @@ fn test_pool_acquire_order_timeout() {
         .dispose(move |_res, _| {
             dcopy.increment();
         })
-        .build();
+        .build()
+        .unwrap();
 
     block_on(async move {
         let mut fst = pool.acquire().await.unwrap();
@@ -62,7 +63,8 @@ fn test_pool_acquire_order_no_timeout() {
         .dispose(move |_res, _| {
             dcopy.increment();
         })
-        .build();
+        .build()
+        .unwrap();
 
     block_on(async move {
         let fst = pool.acquire().await.unwrap();
@@ -97,7 +99,8 @@ fn test_pool_not_sync() {
         let s = source.clone();
         async move { Ok(Cell::new(s.increment())) }
     })
-    .build();
+    .build()
+    .unwrap();
     block_on(async move {
         assert_eq!(pool.acquire().await.unwrap().get(), 1);
     });
@@ -108,7 +111,7 @@ fn test_pool_not_sync() {
 fn test_pool_waiter() {
     let waiting = Arc::new(AtomicCounter::default());
     let results = Arc::new(Mutex::new(vec![]));
-    let pool = counter_pool_config().max_count(1).build();
+    let pool = counter_pool_config().max_count(1).build().unwrap();
     let p1 = pool.clone();
     let mut waiters = 3;
 

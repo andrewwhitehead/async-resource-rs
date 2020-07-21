@@ -3,8 +3,8 @@ use std::time::Duration;
 use futures_util::future::TryFuture;
 
 use super::{
-    default_executor, resource_create, resource_verify, DisposeFn, ErrorFn, Executor, ReleaseFn,
-    ResourceInfo, ResourceOperation,
+    default_executor, resource_create, resource_verify, ConfigError, DisposeFn, ErrorFn, Executor,
+    ReleaseFn, ResourceInfo, ResourceOperation,
 };
 use super::{Pool, PoolInternal};
 
@@ -113,11 +113,11 @@ impl<T: Send, E> PoolConfig<T, E> {
         self
     }
 
-    pub fn build(self) -> Pool<T, E> {
+    pub fn build(self) -> Result<Pool<T, E>, ConfigError> {
         let inner = PoolInternal::new(
             self.acquire_timeout,
             self.on_create,
-            self.executor.unwrap_or_else(default_executor),
+            self.executor.map(Ok).unwrap_or_else(default_executor)?,
             self.handle_error,
             self.idle_timeout,
             self.min_count,
@@ -127,8 +127,6 @@ impl<T: Send, E> PoolConfig<T, E> {
             self.on_release,
             self.on_verify,
         );
-        Pool::new(inner)
-        // let exec = Executor::new(self.thread_count.unwrap_or(1));
-        // Pool::new(queue, mgr, exec)
+        Ok(Pool::new(inner))
     }
 }
