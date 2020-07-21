@@ -24,7 +24,7 @@ fn test_pool_acquire_order_timeout() {
     let dcopy = disposed.clone();
     let pool = counter_pool_config()
         .idle_timeout(Duration::from_secs(1))
-        .dispose(move |_res, _| {
+        .dispose(move |_res, _info| {
             dcopy.increment();
         })
         .build()

@@ -1,16 +1,23 @@
 use std::fmt::{self, Debug, Display, Formatter};
 
+/// An error during resource handle acquisition.
 pub enum AcquireError<E> {
-    Closed,
+    /// The resource pool is closed
+    PoolClosed,
+    /// Wraps an error result from a pool's `create` or `verify` callback
     ResourceError(E),
+    /// The acquire timed out
     Timeout,
 }
 
 impl<E: Debug> Debug for AcquireError<E> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self {
-            Self::Closed => write!(f, "AcquireError::Closed"),
-            Self::ResourceError(err) => write!(f, "AcquireError::ResourceError({:?})", err),
+            Self::PoolClosed => write!(f, "AcquireError::PoolClosed"),
+            Self::ResourceError(err) => f
+                .debug_tuple("AcquireError::ResourceError")
+                .field(err)
+                .finish(),
             Self::Timeout => write!(f, "AcquireError::Timeout"),
         }
     }
@@ -19,7 +26,7 @@ impl<E: Debug> Debug for AcquireError<E> {
 impl<E: Display> Display for AcquireError<E> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self {
-            Self::Closed => write!(f, "The pool is closed"),
+            Self::PoolClosed => write!(f, "The resource pool is closed"),
             Self::ResourceError(err) => write!(f, "Resource error: {}", err),
             Self::Timeout => write!(f, "The request timed out"),
         }
@@ -28,6 +35,7 @@ impl<E: Display> Display for AcquireError<E> {
 
 impl<E: Debug + Display> std::error::Error for AcquireError<E> {}
 
+/// A configuration error.
 #[derive(Debug)]
 pub struct ConfigError(String);
 

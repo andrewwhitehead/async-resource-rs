@@ -4,7 +4,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use super::{AcquireError, Pool, ResourceResolve, Waiter};
+use super::error::AcquireError;
+use super::operation::ResourceResolve;
+use super::pool::Pool;
+use super::wait::Waiter;
 use crate::resource::Managed;
 
 enum AcquireState<T: Send + 'static, E: 'static> {
@@ -13,6 +16,7 @@ enum AcquireState<T: Send + 'static, E: 'static> {
     Waiting(Waiter<ResourceResolve<T, E>>),
 }
 
+/// A Future resolving to a `Managed<T>` or an `AcquireError`.
 pub struct Acquire<T: Send + 'static, E: 'static> {
     pool: Pool<T, E>,
     start: Instant,
@@ -37,7 +41,7 @@ impl<T: Send, E: Debug> Future for Acquire<T, E> {
             Some(state) => state,
             None => {
                 // future already completed
-                return Poll::Ready(Err(AcquireError::Closed));
+                return Poll::Ready(Err(AcquireError::PoolClosed));
             }
         };
 
@@ -69,11 +73,20 @@ impl<T: Send, E: Debug> Future for Acquire<T, E> {
                         self.state.replace(AcquireState::Resolve(resolve));
                         return Poll::Pending;
                     }
-                    Poll::Ready(Some(res)) => {
-                        let res = res
-                            .map(|guard| Managed::new(guard, self.pool.inner.shared().clone()))
-                            .map_err(AcquireError::ResourceError);
-                        return Poll::Ready(res);
+                    Poll::Ready(Some(Ok(guard))) => {
+                        if guard.info().expired {
+                            self.pool.inner.shared().release(guard);
+                            // retry
+                            AcquireState::Init
+                        } else {
+                            return Poll::Ready(Ok(Managed::new(
+                                guard,
+                                self.pool.inner.shared().clone(),
+                            )));
+                        }
+                    }
+                    Poll::Ready(Some(Err(err))) => {
+                        return Poll::Ready(Err(AcquireError::ResourceError(err)));
                     }
                     Poll::Ready(None) => {
                         // Something went wrong during the resolve, start over

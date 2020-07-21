@@ -216,10 +216,12 @@ pub struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
+    #[allow(unused)]
     pub fn cancel(&mut self) -> Option<T> {
         self.inner.cancel_recv()
     }
 
+    #[allow(unused)]
     pub fn recv(&mut self) -> Result<T, Canceled> {
         for _ in 0..20 {
             match self.inner.try_recv() {
@@ -243,6 +245,7 @@ impl<T> Receiver<T> {
         }
     }
 
+    #[allow(unused)]
     pub fn try_recv(&mut self) -> Result<Option<T>, Canceled> {
         self.inner.try_recv()
     }

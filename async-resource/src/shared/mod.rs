@@ -80,7 +80,10 @@ impl<T> Shared<T> {
 
     #[inline]
     fn check_reuse(&self, guard: &mut ResourceGuard<T>) -> bool {
-        if guard.is_some() && (guard.info().reusable || self.busy.load(Ordering::Acquire)) {
+        if guard.is_some()
+            && !guard.info().expired
+            && (guard.info().reusable || self.busy.load(Ordering::Acquire))
+        {
             if let Some(check) = self.on_release.as_ref() {
                 let info = *guard.info();
                 (check)(guard.as_mut().unwrap(), info)
@@ -88,7 +91,7 @@ impl<T> Shared<T> {
                 true
             }
         } else {
-            self.busy.load(Ordering::Acquire)
+            false
         }
     }
 
@@ -167,11 +170,9 @@ impl<T> Shared<T> {
 
     pub fn try_acquire_idle(&self) -> Option<ResourceGuard<T>> {
         while let Ok(res) = self.idle_queue.pop() {
-            // FIXME limit the number of attempts to avoid blocking async?
-            if let Some(mut guard) = res.try_lock() {
+            // FIXME limit the number of attempts to avoid blocking in async?
+            if let Some(guard) = res.try_lock() {
                 if guard.is_some() {
-                    guard.info_mut().last_acquire.replace(Instant::now());
-                    guard.info_mut().acquire_count += 1;
                     // FIXME Cancel outstanding expiry timer?
                     return Some(guard);
                 } else {

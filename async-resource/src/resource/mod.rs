@@ -13,6 +13,7 @@ pub struct ResourceInfo {
     pub acquire_count: usize,
     pub last_acquire: Option<Instant>,
     pub last_idle: Option<Instant>,
+    pub expired: bool,
     pub reusable: bool,
     pub verify_at: Option<Instant>,
 }
@@ -25,6 +26,7 @@ impl Default for ResourceInfo {
             acquire_count: 0,
             last_acquire: None,
             last_idle: None,
+            expired: false,
             reusable: true,
             verify_at: None,
         }

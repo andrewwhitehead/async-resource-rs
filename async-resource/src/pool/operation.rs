@@ -6,7 +6,9 @@ use std::time::Instant;
 
 use futures_util::future::{BoxFuture, FutureExt, TryFuture, TryFutureExt};
 
-use super::{PoolInternal, ResourceGuard, ResourceInfo, Shared};
+use super::pool::PoolInternal;
+use crate::resource::{ResourceGuard, ResourceInfo};
+use crate::shared::Shared;
 
 pub type ResourceFuture<T, E> = BoxFuture<'static, Result<ResourceGuard<T>, E>>;
 
@@ -142,7 +144,7 @@ where
 pub fn resource_verify<C, F, T, E>(update: C) -> impl ResourceOperation<T, E>
 where
     C: Fn(&mut T, ResourceInfo) -> F + Send + Sync,
-    F: TryFuture<Ok = Option<T>, Error = E> + Send + 'static,
+    F: TryFuture<Ok = bool, Error = E> + Send + 'static,
     T: Send + 'static,
 {
     ResourceUpdateFn {
@@ -150,10 +152,9 @@ where
             let mut res = guard.take().unwrap();
             let result = update(&mut res, *guard.info());
             result
-                .and_then(|optres| async move {
-                    if let Some(res) = optres {
-                        guard.replace(res);
-                    }
+                .and_then(|verified| async move {
+                    guard.replace(res);
+                    guard.info_mut().expired = !verified;
                     Ok(guard)
                 })
                 .boxed()

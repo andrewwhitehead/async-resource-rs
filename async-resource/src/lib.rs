@@ -6,4 +6,4 @@ pub use resource::Managed;
 
 mod shared;
 
-pub mod util;
+mod util;

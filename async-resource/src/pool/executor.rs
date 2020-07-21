@@ -2,15 +2,18 @@ use futures_util::future::BoxFuture;
 
 use super::error::ConfigError;
 
+/// Defines a pluggable executor for Futures evaluated within the context of the
+/// resource pool.
 pub trait Executor: Send + Sync {
+    /// Spawn a static, boxed Future with no return value
     fn spawn_ok(&self, task: BoxFuture<'static, ()>);
 }
 
 #[cfg(feature = "multitask-exec")]
-mod exec_multitask {
+mod multitask_exec {
     use super::BoxFuture;
     use super::Executor;
-    use crate::pool::Sentinel;
+    use crate::util::sentinel::Sentinel;
     use crate::util::thread_waker;
     use multitask::Executor as MTExecutor;
     use option_lock::{self, OptionLock};
@@ -108,14 +111,18 @@ mod exec_multitask {
 }
 
 #[cfg(feature = "multitask-exec")]
-pub use exec_multitask::MultitaskExecutor;
+pub use multitask_exec::MultitaskExecutor;
 
 #[cfg(feature = "multitask-exec")]
+/// Returns a default `Executor` instance to use when constructing a resource
+/// pool.
 pub fn default_executor() -> Result<Box<dyn Executor>, ConfigError> {
-    Ok(Box::new(exec_multitask::MultitaskExecutor::global()))
+    Ok(Box::new(multitask_exec::MultitaskExecutor::global()))
 }
 
 #[cfg(not(any(feature = "multitask-exec")))]
+/// Returns a default `Executor` instance to use when constructing a resource
+/// pool.
 pub fn default_executor() -> Result<Box<dyn Executor>, ConfigError> {
     Err(ConfigError("No default executor is provided"))
 }

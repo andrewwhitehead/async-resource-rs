@@ -5,6 +5,8 @@ use std::sync::Arc;
 use super::{ResourceGuard, ResourceInfo};
 use crate::shared::Shared;
 
+/// A reference to an acquired resource, which dereferences to the resource
+/// instance. When dropped, it returns the contained resource to the pool.
 pub struct Managed<T> {
     shared: Option<Arc<Shared<T>>>,
     value: Option<ResourceGuard<T>>,

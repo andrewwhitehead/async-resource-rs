@@ -2,12 +2,15 @@ use std::time::Duration;
 
 use futures_util::future::TryFuture;
 
-use super::{
-    default_executor, resource_create, resource_verify, ConfigError, DisposeFn, ErrorFn, Executor,
-    ReleaseFn, ResourceInfo, ResourceOperation,
-};
-use super::{Pool, PoolInternal};
+use super::error::ConfigError;
+use super::executor::{default_executor, Executor};
+use super::operation::{resource_create, resource_verify, ResourceOperation};
+use super::pool::{ErrorFn, Pool, PoolInternal};
+use crate::resource::ResourceInfo;
+use crate::shared::{DisposeFn, ReleaseFn};
 
+/// A pool configuration instance, used to build a new instance of a resource
+/// pool.
 pub struct PoolConfig<T: Send, E> {
     acquire_timeout: Option<Duration>,
     executor: Option<Box<dyn Executor>>,
@@ -23,6 +26,8 @@ pub struct PoolConfig<T: Send, E> {
 }
 
 impl<T: Send, E> PoolConfig<T, E> {
+    /// Create a new pool configuration from a resource constructor function.
+    /// The function must return a Future resolving to a `Result<T, E>`.
     pub fn new<C, F>(create: C) -> Self
     where
         C: Fn() -> F + Send + Sync + 'static,
@@ -45,6 +50,8 @@ impl<T: Send, E> PoolConfig<T, E> {
         }
     }
 
+    /// Set the pool default timeout for resource acquisition. A zero-length
+    /// `Duration` indicates no default timeout.
     pub fn acquire_timeout(mut self, val: Duration) -> Self {
         if val.as_micros() > 0 {
             self.acquire_timeout.replace(val);
@@ -54,6 +61,8 @@ impl<T: Send, E> PoolConfig<T, E> {
         self
     }
 
+    /// Set a callback method to execute when a resource is disposed
+    /// because it is no longer needed or it has failed validation.
     pub fn dispose<F>(mut self, dispose: F) -> Self
     where
         F: Fn(T, ResourceInfo) -> () + Send + Sync + 'static,
@@ -62,6 +71,8 @@ impl<T: Send, E> PoolConfig<T, E> {
         self
     }
 
+    /// Set a callback method to execute when an error is raised during
+    /// resource creation or validation.
     pub fn handle_error<F>(mut self, handler: F) -> Self
     where
         F: Fn(E) + Send + Sync + 'static,
@@ -70,6 +81,9 @@ impl<T: Send, E> PoolConfig<T, E> {
         self
     }
 
+    /// Set the idle timeout for resources. A zero-length `Duration` implies
+    /// that resources will be disposed immediately when they are released,
+    /// unless there are active pending acquisition requests.
     pub fn idle_timeout(mut self, val: Duration) -> Self {
         if val.as_micros() > 0 {
             self.idle_timeout.replace(val);
@@ -79,10 +93,12 @@ impl<T: Send, E> PoolConfig<T, E> {
         self
     }
 
+    /// Set the callback used to verify a resource once its idle timeout has
+    /// expired.
     pub fn verify<V, F>(mut self, verify: V) -> Self
     where
         V: Fn(&mut T, ResourceInfo) -> F + Send + Sync + 'static,
-        F: TryFuture<Ok = Option<T>, Error = E> + Send + 'static,
+        F: TryFuture<Ok = bool, Error = E> + Send + 'static,
         T: Send + 'static,
         E: 'static,
     {
@@ -90,21 +106,34 @@ impl<T: Send, E> PoolConfig<T, E> {
         self
     }
 
+    /// Set the maximum number of resource instances to create within the
+    /// resulting `Pool` instance. Set to zero in order to enforce no maximum
+    /// count.
     pub fn max_count(mut self, val: usize) -> Self {
         self.max_count = val;
         self
     }
 
+    /// Set the maximum number of waiters allowed by the `Pool` instance when
+    /// no idle resources are available and the maximum number of resources
+    /// have been created. When the maximum number has been reached, subsequent
+    /// attempts to acquire a resource may resolve to `AcquireError::Busy`.
     pub fn max_waiters(mut self, val: usize) -> Self {
         self.max_waiters.replace(val);
         self
     }
 
+    /// Set the minimum number of resources to keep instantiated. This helps to
+    /// reduce the latency before a request can be satisfied.
     pub fn min_count(mut self, val: usize) -> Self {
         self.min_count = val;
         self
     }
 
+    /// Set a callback to be executed when a resource instance is released
+    /// back to the `Pool` after being acquired. This callback should return
+    /// `true` if the instance is capable of being reused, and `false` if it
+    /// should be disposed.
     pub fn release<F>(mut self, release: F) -> Self
     where
         F: Fn(&mut T, ResourceInfo) -> bool + Send + Sync + 'static,
@@ -113,6 +142,7 @@ impl<T: Send, E> PoolConfig<T, E> {
         self
     }
 
+    /// Convert the pool configuration into a new `Pool` instance.
     pub fn build(self) -> Result<Pool<T, E>, ConfigError> {
         let inner = PoolInternal::new(
             self.acquire_timeout,
