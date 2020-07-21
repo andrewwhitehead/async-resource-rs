@@ -3,9 +3,11 @@ name = "async-resource"
 version = "0.1.0"
 authors = ["Andrew Whitehead <cywolf@gmail.com>"]
 edition = "2018"
-
 description = "Async resource pool"
 license = "MIT/Apache-2.0"
+#readme = "README.md"
+repository = "https://github.com/andrewwhitehead/async-resource-rs/"
+keywords = ["async", "resource", "pool"]
 
 [lib]
 name = "async_resource"
