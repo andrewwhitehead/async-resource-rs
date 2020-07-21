@@ -2,12 +2,12 @@
 //! can be acquired for either an exclusive write lock or a series of read
 //! locks, using a single atomic operation per acquisition.
 //!
-//! The `read`, `try_lock`, and `try_take` operations are non-blocking and
-//! appropriate for reading or writing within a Future, but the lock cannot
-//! register wakers or park the current thread.
+//! The `try_lock`, `try_read`, and `try_take` operations are non-blocking and
+//! appropriate for using within a polled Future, but the lock cannot register
+//! wakers or park the current thread.
 //!
-//! This structure allows for multiple usage patterns. For example, it can be
-//! used to ement a version of `once_cell` / `lazy_static`:
+//! This structure allows for multiple usage patterns. As one example, it can
+//! be used to implement a version of `once_cell` / `lazy_static`:
 //!
 //! ```
 //! use option_lock::{OptionLock, OptionGuard, OptionRead, ReadError};
@@ -300,6 +300,9 @@ pub struct OptionRead<'a, T> {
 }
 
 impl<'a, T: 'a> OptionRead<'a, T> {
+    /// Try to upgrade a read guard to a write guard.
+    ///
+    /// This requires that there are no other active readers.
     pub fn try_lock(read: OptionRead<'a, T>) -> Result<OptionGuard<'a, T>, OptionRead<'a, T>> {
         let mut state = (1 << SHIFT) | AVAILABLE;
         loop {
@@ -323,6 +326,9 @@ impl<'a, T: 'a> OptionRead<'a, T> {
         }
     }
 
+    /// Try to take the contained value from an acquired read guard.
+    ///
+    /// This requires that there are no other active readers.
     pub fn try_take(read: OptionRead<'a, T>) -> Result<T, OptionRead<'a, T>> {
         Self::try_lock(read).map(|mut guard| guard.take().unwrap())
     }
@@ -379,6 +385,7 @@ pub struct OptionGuard<'a, T> {
 }
 
 impl<T> OptionGuard<'_, T> {
+    /// Downgrade a write guard to a read guard.
     pub fn downgrade<'a>(guard: OptionGuard<'a, T>) -> Option<OptionRead<'_, T>> {
         if guard.is_some() {
             guard
