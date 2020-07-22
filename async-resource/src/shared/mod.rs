@@ -80,9 +80,12 @@ impl<T> Shared<T> {
 
     #[inline]
     fn check_reuse(&self, guard: &mut ResourceGuard<T>) -> bool {
+        let min_count = self.min_count();
         if guard.is_some()
             && !guard.info().expired
-            && (guard.info().reusable || self.busy.load(Ordering::Acquire))
+            && (guard.info().reusable
+                || self.busy.load(Ordering::Acquire)
+                || (min_count > 0 && self.count() <= min_count))
         {
             if let Some(check) = self.on_release.as_ref() {
                 let info = *guard.info();
