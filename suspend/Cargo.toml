@@ -1,0 +1,18 @@
+[package]
+name = "suspend"
+version = "0.1.0"
+authors = ["Andrew Whitehead <cywolf@gmail.com>"]
+edition = "2018"
+description = "A common mechanism for suspending a thread or a Future until notified"
+license = "MIT/Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/andrewwhitehead/async-resource-rs/"
+categories = ["concurrency", "data-structures"]
+keywords = ["park", "suspend", "thread", "waker"]
+
+[lib]
+name = "suspend"
+path = "src/lib.rs"
+
+[dependencies]
+futures-util = "0.3"
