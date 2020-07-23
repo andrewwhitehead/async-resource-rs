@@ -2,13 +2,14 @@ use std::time::Duration;
 
 use futures_util::future::TryFuture;
 
+use suspend::Suspend;
+
 use super::error::ConfigError;
 use super::executor::{default_executor, Executor};
 use super::operation::{resource_create, resource_verify, ResourceOperation};
 use super::pool::{ErrorFn, Pool, PoolInternal};
 use crate::resource::ResourceInfo;
 use crate::shared::{DisposeFn, ReleaseFn};
-
 /// A pool configuration instance, used to build a new instance of a resource
 /// pool.
 pub struct PoolConfig<T: Send, E> {
@@ -144,6 +145,7 @@ impl<T: Send, E> PoolConfig<T, E> {
 
     /// Convert the pool configuration into a new `Pool` instance.
     pub fn build(self) -> Result<Pool<T, E>, ConfigError> {
+        let suspend = Suspend::new();
         let inner = PoolInternal::new(
             self.acquire_timeout,
             self.on_create,
@@ -153,10 +155,11 @@ impl<T: Send, E> PoolConfig<T, E> {
             self.min_count,
             self.max_count,
             self.max_waiters,
+            suspend.notifier(),
             self.on_dispose,
             self.on_release,
             self.on_verify,
         );
-        Ok(Pool::new(inner))
+        Ok(Pool::new(inner, suspend))
     }
 }

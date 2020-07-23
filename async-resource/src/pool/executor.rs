@@ -11,25 +11,24 @@ pub trait Executor: Send + Sync {
 
 #[cfg(feature = "multitask-exec")]
 mod multitask_exec {
-    use super::BoxFuture;
-    use super::Executor;
-    use crate::util::sentinel::Sentinel;
-    use crate::util::thread_waker;
-    use multitask::Executor as MTExecutor;
-    use option_lock::{self, OptionLock};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     };
     use std::thread;
 
+    use multitask::Executor as MTExecutor;
+    use option_lock::{self, OptionLock};
+    use suspend::{Notifier, Suspend};
+
+    use super::BoxFuture;
+    use super::Executor;
+    use crate::util::sentinel::Sentinel;
+
     const GLOBAL_INST: OptionLock<MultitaskExecutor> = OptionLock::new();
 
     pub struct MultitaskExecutor {
-        inner: Sentinel<(
-            MTExecutor,
-            Vec<(thread::JoinHandle<()>, thread_waker::Waker)>,
-        )>,
+        inner: Sentinel<(MTExecutor, Vec<(thread::JoinHandle<()>, Notifier)>)>,
     }
 
     impl MultitaskExecutor {
@@ -39,21 +38,22 @@ mod multitask_exec {
             let running = Arc::new(AtomicBool::new(true));
             let tickers = (0..threads)
                 .map(|_| {
-                    let (waker, waiter) = thread_waker::pair();
-                    let waker_copy = waker.clone();
-                    let ticker = ex.ticker(move || waker_copy.wake());
+                    let mut suspend = Suspend::new();
+                    let parent_notifier = suspend.notifier();
+                    let ticker_notifier = suspend.notifier();
+                    let ticker = ex.ticker(move || ticker_notifier.notify());
                     let running = running.clone();
                     (
                         thread::spawn(move || loop {
+                            let mut listener = suspend.listen();
                             if !ticker.tick() {
-                                waiter.prepare_wait();
                                 if !running.load(Ordering::Acquire) {
                                     break;
                                 }
-                                waiter.wait();
+                                listener.park();
                             }
                         }),
-                        waker,
+                        parent_notifier,
                     )
                 })
                 .collect();
@@ -63,8 +63,8 @@ mod multitask_exec {
                     if count == 0 {
                         running.store(false, Ordering::Release);
                         if let Ok((_, threads)) = Arc::try_unwrap(inner) {
-                            for (thread, waker) in threads {
-                                waker.wake();
+                            for (thread, notifier) in threads {
+                                notifier.notify();
                                 thread.join().unwrap();
                             }
                         } else {

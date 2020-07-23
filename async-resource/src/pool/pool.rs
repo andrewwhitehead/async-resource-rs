@@ -13,9 +13,11 @@ use concurrent_queue::ConcurrentQueue;
 
 use futures_util::FutureExt;
 
+use suspend::{Notifier, Suspend};
+
 use crate::resource::{ResourceGuard, ResourceInfo, ResourceLock};
 use crate::shared::{DisposeFn, ReleaseFn, Shared, SharedEvent};
-use crate::util::{sentinel::Sentinel, thread_waker};
+use crate::util::sentinel::Sentinel;
 
 use super::acquire::Acquire;
 use super::executor::Executor;
@@ -39,7 +41,6 @@ pub(crate) struct PoolManageState<T: Send + 'static, E: 'static> {
     executor: Box<dyn Executor>,
     handle_error: Option<ErrorFn<E>>,
     max_waiters: Option<usize>,
-    shared_waiter: thread_waker::Waiter,
     register_inject: ConcurrentQueue<Register<T, E>>,
     state: AtomicU8,
     verify: Option<BoxedOperation<T, E>>,
@@ -60,12 +61,19 @@ impl<T: Send, E> PoolInternal<T, E> {
         min_count: usize,
         max_count: usize,
         max_waiters: Option<usize>,
+        notifier: Notifier,
         on_dispose: Option<DisposeFn<T>>,
         on_release: Option<ReleaseFn<T>>,
         verify: Option<Box<dyn ResourceOperation<T, E> + Send + Sync>>,
     ) -> Self {
-        let (shared, shared_waiter) =
-            Shared::new(on_release, on_dispose, min_count, max_count, idle_timeout);
+        let shared = Shared::new(
+            notifier,
+            on_release,
+            on_dispose,
+            min_count,
+            max_count,
+            idle_timeout,
+        );
         let manage = PoolManageState {
             acquire_timeout,
             create,
@@ -73,7 +81,6 @@ impl<T: Send, E> PoolInternal<T, E> {
             handle_error,
             max_waiters,
             register_inject: ConcurrentQueue::unbounded(),
-            shared_waiter,
             state: AtomicU8::new(ACTIVE),
             verify,
         };
@@ -116,7 +123,7 @@ impl<T: Send, E> PoolInternal<T, E> {
         }
     }
 
-    fn manage(self: Arc<Self>) {
+    fn manage(self: Arc<Self>, mut suspend: Suspend) {
         let mut drain_count: usize = 0;
         let inner = Sentinel::new(self, |inner, _| {
             // Set the state to Stopped when this thread exits, whether normally
@@ -184,7 +191,7 @@ impl<T: Send, E> PoolInternal<T, E> {
 
             // Set the waiter state to Idle.
             // If anything is subsequently added to the queues, it will move to Busy.
-            inner.manage.shared_waiter.prepare_wait();
+            let mut listener = suspend.listen();
 
             while let Some(event) = inner.shared.pop_event() {
                 match event {
@@ -274,9 +281,9 @@ impl<T: Send, E> PoolInternal<T, E> {
             }
 
             if let Some(next_check) = next_check {
-                inner.manage.shared_waiter.wait_until(next_check);
+                listener.park_until(next_check);
             } else {
-                inner.manage.shared_waiter.wait();
+                listener.park();
             }
             next_check = None;
         }
@@ -441,7 +448,7 @@ pub struct Pool<T: Send + 'static, E: 'static> {
 }
 
 impl<T: Send, E> Pool<T, E> {
-    pub(crate) fn new(inner: PoolInternal<T, E>) -> Self {
+    pub(crate) fn new(inner: PoolInternal<T, E>, suspend: Suspend) -> Self {
         let inner = Arc::new(inner);
         let mgr = inner.clone();
         let sentinel = Sentinel::new(inner, |inner, count| {
@@ -449,7 +456,7 @@ impl<T: Send, E> Pool<T, E> {
                 inner.start_drain(true);
             }
         });
-        std::thread::spawn(move || mgr.manage());
+        std::thread::spawn(move || mgr.manage(suspend));
         Self { inner: sentinel }
     }
 

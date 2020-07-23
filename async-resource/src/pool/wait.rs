@@ -2,34 +2,42 @@ use std::fmt::{self, Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use crate::util::dropshot;
-pub use dropshot::Canceled;
+use dropshot;
+use option_lock::OptionLock;
+
+pub use self::dropshot::Canceled;
 
 pub fn waiter_pair<T>() -> (WaitResponder<T>, Waiter<T>) {
     let (sender, receiver) = dropshot::channel();
     (
         WaitResponder {
-            sender: Arc::new(sender),
+            sender: Arc::new(OptionLock::from(sender)),
         },
         Waiter { receiver },
     )
 }
 
 pub struct WaitResponder<T> {
-    sender: Arc<dropshot::Sender<T>>,
+    sender: Arc<OptionLock<dropshot::Sender<T>>>,
 }
 
 impl<T> WaitResponder<T> {
-    pub fn cancel(&self) -> bool {
-        self.sender.cancel()
+    pub fn cancel(self) {
+        if let Ok(sender) = self.sender.try_take() {
+            drop(sender);
+        }
     }
 
     pub fn is_canceled(&self) -> bool {
-        self.sender.is_canceled()
+        !self.sender.status().can_take()
     }
 
-    pub fn send(&self, resolve: T) -> Result<(), T> {
-        self.sender.send(resolve)
+    pub fn send(self, resolve: T) -> Result<(), T> {
+        if let Ok(sender) = self.sender.try_take() {
+            sender.send(resolve)
+        } else {
+            Err(resolve)
+        }
     }
 }
 

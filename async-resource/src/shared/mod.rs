@@ -2,10 +2,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use concurrent_queue::ConcurrentQueue;
+use suspend::Notifier;
 
 use super::resource::{ResourceGuard, ResourceInfo, ResourceLock};
-
-use super::util::thread_waker;
 
 pub type ReleaseFn<T> = Box<dyn Fn(&mut T, ResourceInfo) -> bool + Send + Sync>;
 pub type DisposeFn<T> = Box<dyn Fn(T, ResourceInfo) + Send + Sync>;
@@ -24,36 +23,33 @@ pub struct Shared<T> {
     idle_timeout: Option<Duration>,
     max_count: usize,
     min_count: usize,
+    notifier: Notifier,
     on_dispose: Option<DisposeFn<T>>,
     on_release: Option<ReleaseFn<T>>,
-    waker: thread_waker::Waker,
 }
 
 impl<T> Shared<T> {
     pub fn new(
+        notifier: Notifier,
         on_release: Option<ReleaseFn<T>>,
         on_dispose: Option<DisposeFn<T>>,
         min_count: usize,
         max_count: usize,
         idle_timeout: Option<Duration>,
-    ) -> (Self, thread_waker::Waiter) {
-        let (waker, waiter) = thread_waker::pair();
-        (
-            Self {
-                busy: AtomicBool::new(false),
-                count: AtomicUsize::new(0),
-                dispose_count: AtomicUsize::new(0),
-                event_queue: ConcurrentQueue::unbounded(),
-                idle_queue: ConcurrentQueue::unbounded(),
-                idle_timeout,
-                max_count,
-                min_count,
-                on_dispose,
-                on_release,
-                waker,
-            },
-            waiter,
-        )
+    ) -> Self {
+        Self {
+            busy: AtomicBool::new(false),
+            count: AtomicUsize::new(0),
+            dispose_count: AtomicUsize::new(0),
+            event_queue: ConcurrentQueue::unbounded(),
+            idle_queue: ConcurrentQueue::unbounded(),
+            idle_timeout,
+            max_count,
+            min_count,
+            notifier,
+            on_dispose,
+            on_release,
+        }
     }
 
     pub fn dispose(&self, mut guard: ResourceGuard<T>) {
@@ -124,7 +120,7 @@ impl<T> Shared<T> {
 
     pub fn notify(&self) {
         // Wake the manager thread if it is parked
-        self.waker.wake();
+        self.notifier.notify();
     }
 
     pub fn pop_event(&self) -> Option<SharedEvent<T>> {
