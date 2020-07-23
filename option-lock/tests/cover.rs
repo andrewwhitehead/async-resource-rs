@@ -161,3 +161,32 @@ fn option_lock_debug() {
         "OptionLock { status: ExclusiveLock }"
     );
 }
+
+#[test]
+fn option_lock_drop() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let dropped = Arc::new(AtomicUsize::new(0));
+
+    struct D(Arc<AtomicUsize>);
+
+    impl Drop for D {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    let lock = OptionLock::<D>::new();
+    drop(lock);
+
+    let lock = OptionLock::from(D(dropped.clone()));
+    drop(lock);
+    assert_eq!(dropped.load(Ordering::Acquire), 1);
+
+    let lock = OptionLock::new();
+    lock.try_lock().unwrap().replace(D(dropped.clone()));
+    drop(lock);
+    assert_eq!(dropped.load(Ordering::Acquire), 2);
+}
