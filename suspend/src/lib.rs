@@ -10,7 +10,12 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use futures_util::task::{waker, ArcWake};
+use futures_util::{
+    pin_mut,
+    task::{waker, ArcWake},
+};
+
+// FIXME add Debug impl
 
 const IDLE: u8 = 0x0;
 const BUSY: u8 = 0x1;
@@ -228,6 +233,16 @@ impl NotifyOnce {
     pub fn poll(&self, waker: &Waker) -> Poll<()> {
         self.inner.poll(waker)
     }
+
+    pub fn waker(self: &Arc<Self>) -> Waker {
+        waker(self.clone())
+    }
+}
+
+impl ArcWake for NotifyOnce {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.complete();
+    }
 }
 
 impl Future for NotifyOnce {
@@ -249,6 +264,22 @@ impl Suspend {
                 notify: UnsafeCell::new(MaybeUninit::uninit()),
                 state: AtomicU8::new(BUSY),
             }),
+        }
+    }
+
+    pub fn block_on<F>(&mut self, fut: F) -> F::Output
+    where
+        F: Future,
+    {
+        pin_mut!(fut);
+        loop {
+            let waker = self.waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut listen = self.listen();
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => break result,
+                Poll::Pending => listen.park(),
+            }
         }
     }
 
