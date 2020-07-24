@@ -282,6 +282,16 @@ impl<T> Receiver<T> {
         self.inner.cancel_recv()
     }
 
+    pub fn map<F, R>(self, f: F) -> MapReceiver<T, R>
+    where
+        F: Fn(T) -> R + 'static,
+    {
+        MapReceiver {
+            receiver: self,
+            f: Box::new(f),
+        }
+    }
+
     pub fn recv(&mut self) -> Result<T, Canceled> {
         self.inner.recv()
     }
@@ -294,7 +304,7 @@ impl<T> Receiver<T> {
 impl<T> Future for Receiver<T> {
     type Output = Result<T, Canceled>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<T, Canceled>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.inner.poll_recv(Some(cx.waker()))
     }
 }
@@ -302,6 +312,36 @@ impl<T> Future for Receiver<T> {
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         self.inner.cancel_recv();
+    }
+}
+
+pub struct MapReceiver<T, R> {
+    receiver: Receiver<T>,
+    f: Box<dyn Fn(T) -> R>,
+}
+
+impl<T, R> MapReceiver<T, R> {
+    pub fn cancel(&mut self) -> Option<T> {
+        self.receiver.cancel()
+    }
+
+    pub fn recv(&mut self) -> Result<R, Canceled> {
+        self.receiver.recv().map(&self.f)
+    }
+
+    pub fn try_recv(&mut self) -> Result<Option<R>, Canceled> {
+        self.receiver.try_recv().map(|opt| opt.map(&self.f))
+    }
+}
+
+impl<T, R> Future for MapReceiver<T, R> {
+    type Output = Result<R, Canceled>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.receiver
+            .inner
+            .poll_recv(Some(cx.waker()))
+            .map(|r| r.map(&self.f))
     }
 }
 
