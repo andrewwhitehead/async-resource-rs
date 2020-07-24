@@ -7,4 +7,4 @@ pub use resource::Managed;
 mod shared;
 
 mod util;
-pub use util::injector;
+pub use util::thread;
