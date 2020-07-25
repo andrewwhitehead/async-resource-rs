@@ -77,7 +77,6 @@ use std::time::{Duration, Instant};
 use futures_core::{
     future::BoxFuture,
     stream::{BoxStream, Stream},
-    // FutureExt, StreamExt,
 };
 use futures_task::{waker, ArcWake};
 
