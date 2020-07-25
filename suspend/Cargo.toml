@@ -15,4 +15,4 @@ name = "suspend"
 path = "src/lib.rs"
 
 [dependencies]
-futures-util = { version = "0.3", default-features = false, features = ["async-await", "async-await-macro"] }
+futures-util = "0.3"
