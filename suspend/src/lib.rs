@@ -22,14 +22,12 @@ use futures_util::{
 #[cfg(feature = "oneshot")]
 pub use oneshot_rs as oneshot;
 
-// FIXME add Debug impl
-
 const IDLE: u8 = 0x0;
-const BUSY: u8 = 0x1;
+const WAIT: u8 = 0x1;
 const LISTEN: u8 = 0x2;
 
 pub fn notify_once<'a>() -> (Notifier, Task<'a, ()>) {
-    let inner = Arc::new(Inner::new(IDLE));
+    let inner = Arc::new(Inner::new(WAIT));
     let notifier = Notifier {
         inner: inner.clone(),
     };
@@ -78,15 +76,15 @@ impl Inner {
     }
 
     pub fn acquire<'a>(self: &'a Arc<Self>) -> Option<Listener<'a>> {
-        if self.state.compare_and_swap(BUSY, IDLE, Ordering::AcqRel) == BUSY {
+        if self.state.compare_and_swap(IDLE, WAIT, Ordering::AcqRel) == IDLE {
             Some(Listener { inner: self })
         } else {
             None
         }
     }
 
-    pub fn clear(&self, idle: bool) -> ClearResult {
-        let newval = if idle { IDLE } else { BUSY };
+    pub fn clear(&self, wait: bool) -> ClearResult {
+        let newval = if wait { WAIT } else { IDLE };
         match self.state.swap(newval, Ordering::Release) {
             LISTEN => ClearResult::Removed(unsafe { self.vacate() }),
             state => {
@@ -101,16 +99,17 @@ impl Inner {
 
     pub fn listen(&self, notify: InnerNotify) -> bool {
         match self.state() {
-            IDLE => (),
-            BUSY => {
+            IDLE => {
+                // not currently acquired
                 return false;
             }
+            WAIT => (),
             LISTEN => {
-                // try to reacquire idle state
+                // try to reacquire wait state
                 loop {
                     match self.state.compare_exchange_weak(
                         LISTEN,
-                        IDLE,
+                        WAIT,
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
@@ -119,7 +118,7 @@ impl Inner {
                                 self.vacate();
                             }
                         }
-                        Err(IDLE) => {
+                        Err(WAIT) => {
                             // competition from another thread?
                             // should not happen with wrappers around this instance
                             panic!("Invalid state");
@@ -127,7 +126,7 @@ impl Inner {
                         Err(LISTEN) => {
                             // retry
                         }
-                        Err(BUSY) => {
+                        Err(IDLE) => {
                             // already notified
                             return false;
                         }
@@ -140,9 +139,9 @@ impl Inner {
         unsafe {
             self.update(notify);
         }
-        match self.state.compare_and_swap(IDLE, LISTEN, Ordering::AcqRel) {
-            IDLE => true,
-            BUSY => {
+        match self.state.compare_and_swap(WAIT, LISTEN, Ordering::AcqRel) {
+            WAIT => true,
+            IDLE => {
                 // notify was called while storing
                 unsafe {
                     self.vacate();
@@ -170,11 +169,11 @@ impl Inner {
 
     pub fn poll(&self, waker: &Waker) -> Poll<()> {
         match self.state() {
-            BUSY => {
+            IDLE => {
                 return Poll::Ready(());
             }
             LISTEN => {
-                // try to clear existing waker and move back to idle state
+                // try to clear existing waker and move back to wait state
                 if self.clear(true).is_none() {
                     // already taken (thread was pre-empted)
                     return Poll::Ready(());
@@ -210,7 +209,7 @@ impl Inner {
         }
         loop {
             thread::park();
-            if self.state() == BUSY {
+            if self.state() == IDLE {
                 break;
             }
         }
@@ -223,7 +222,7 @@ impl Inner {
         }
         while let Some(dur) = expire.checked_duration_since(Instant::now()) {
             thread::park_timeout(dur);
-            if self.state() == BUSY {
+            if self.state() == IDLE {
                 // notified
                 return true;
             }
@@ -261,7 +260,7 @@ unsafe impl Sync for Inner {}
 //         Self {
 //             inner: Inner {
 //                 notify: UnsafeCell::new(MaybeUninit::uninit()),
-//                 state: AtomicU8::new(IDLE),
+//                 state: AtomicU8::new(WAIT),
 //             },
 //         }
 //     }
@@ -278,7 +277,7 @@ unsafe impl Sync for Inner {}
 //     }
 
 //     pub fn is_complete(&self) -> bool {
-//         self.inner.state() == BUSY
+//         self.inner.state() == IDLE
 //     }
 
 //     pub fn poll(&self, waker: &Waker) -> Poll<()> {
@@ -323,7 +322,7 @@ pub struct Suspend {
 impl Suspend {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Inner::new(BUSY)),
+            inner: Arc::new(Inner::new(IDLE)),
         }
     }
 
@@ -363,6 +362,18 @@ impl Suspend {
 
     pub fn waker(&self) -> Waker {
         waker(self.inner.clone())
+    }
+}
+
+impl Debug for Suspend {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let state = match self.inner.state() {
+            IDLE => "Idle",
+            WAIT => "Waiting",
+            LISTEN => "Listening",
+            _ => "<!>",
+        };
+        write!(f, "Suspend({})", state)
     }
 }
 
