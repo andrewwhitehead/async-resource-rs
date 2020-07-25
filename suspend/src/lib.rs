@@ -35,7 +35,7 @@
 //! use suspend::{Iter, block_on};
 //!
 //! let mut values = Iter::from_iterator(1..);
-//! assert_eq!(block_on(values.next()), Some(1));
+//! assert_eq!(block_on(async { values.next().await }), Some(1));
 //! assert_eq!(values.take(3).collect::<Vec<_>>(), vec![2, 3, 4]);
 //! ```
 //!
@@ -484,8 +484,8 @@ impl Debug for Suspend {
 }
 
 /// The result of acquiring a `Suspend` using either [`Suspend::listen`] or
-/// [`Suspend::try_listen`]. It may be used to wait for a notification using
-/// `await` or by parking the current thread.
+/// [`Suspend::try_listen`]. It may be used to wait for a notification with
+/// `.await` or by parking the current thread.
 pub struct Listener<'a> {
     inner: &'a Arc<Inner>,
 }
@@ -572,7 +572,7 @@ impl<T> TaskState<'_, T> {
     }
 }
 
-/// An asynchronous result which may be evaluated using `await`, or by using
+/// An asynchronous result which may be evaluated with `.await`, or by using
 /// blocking operations with an optional timeout.
 #[must_use = "Task must be awaited"]
 pub struct Task<'t, T> {
