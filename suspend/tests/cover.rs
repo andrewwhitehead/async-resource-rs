@@ -17,6 +17,11 @@ fn simple_timer<'a>(duration: Duration) -> Task<'a, ()> {
 }
 
 #[test]
+fn block_simple() {
+    assert_eq!(block_on(async { 25 }), 25);
+}
+
+#[test]
 fn task_map() {
     let task = Task::from_future(async { 25 }).map(|x| x * 2);
     assert_eq!(task.wait(), 50);
@@ -65,8 +70,8 @@ fn iter_stream() {
 }
 
 #[test]
-fn oneshot() {
-    let (sender, task) = Task::oneshot();
+fn send_task() {
+    let (sender, task) = sender_task();
     sender.send(15).unwrap();
     assert_eq!(task.wait(), Ok(15));
 }

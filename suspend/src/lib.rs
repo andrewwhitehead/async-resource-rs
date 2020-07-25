@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use futures_util::{
     future::BoxFuture,
-    pin_mut,
     stream::{BoxStream, Stream},
     task::{waker, ArcWake},
     FutureExt, StreamExt,
@@ -22,16 +21,56 @@ use futures_util::{
 #[cfg(feature = "oneshot")]
 pub use oneshot_rs as oneshot;
 
+#[cfg(feature = "oneshot")]
+/// A `oneshot::Sender` used to provide a single asynchronous result.
+/// Requires the `oneshot` feature.
+pub use oneshot::Sender;
+
+#[cfg(feature = "oneshot")]
+/// An error returned if the associated `oneshot::Sender` is dropped.
+/// Requires the `oneshot` feature.
+pub use oneshot::RecvError;
+
 const IDLE: u8 = 0x0;
 const WAIT: u8 = 0x1;
 const LISTEN: u8 = 0x2;
 
+/// A convenience method to evaluate a `Future`, blocking the current thread
+/// until it is resolved.
+pub fn block_on<F>(fut: F) -> F::Output
+where
+    F: Future + Send,
+{
+    Task::from_future(fut).wait()
+}
+
+/// A convenience method to turn a `Stream` into an `Iterator` which parks the
+/// current thread until items are available.
+pub fn iter_stream<'s, S>(stream: S) -> Iter<'s, S::Item>
+where
+    S: Stream + Send + 's,
+{
+    Iter::from_stream(stream)
+}
+
+/// Create a new single-use `Notifier` and a corresponding `Task`. Once
+/// notified, the `Task` will resolve to `()`.
 pub fn notify_once<'a>() -> (Notifier, Task<'a, ()>) {
     let inner = Arc::new(Inner::new(WAIT));
     let notifier = Notifier {
         inner: inner.clone(),
     };
     (notifier, Task::from_poll(move |cx| inner.poll(cx.waker())))
+}
+
+#[cfg(feature = "oneshot")]
+/// Create a new oneshot message pair consisting of a `Sender` and a
+/// `Task<T>`. Once `Sender::send` is called or the `Sender` is dropped,
+/// the `Task` will resolve to the sent message or a `RecvError`.
+/// Requires the `oneshot` feature.
+pub fn sender_task<'t, T: Send + 't>() -> (oneshot::Sender<T>, Task<'t, Result<T, RecvError>>) {
+    let (sender, receiver) = oneshot::channel();
+    (sender, Task::from(receiver))
 }
 
 enum InnerNotify {
@@ -45,6 +84,8 @@ enum ClearResult {
     Updated,
 }
 
+/// A timeout error which may be returned when waiting for a `Suspend` or
+/// `Iter` with a given timeout.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TimeoutError;
 
@@ -315,51 +356,48 @@ unsafe impl Sync for Inner {}
 //     }
 // }
 
+/// A structure which may be used to suspend a thread or `Future` pending a
+/// notification.
 pub struct Suspend {
     inner: Arc<Inner>,
 }
 
 impl Suspend {
+    /// Construct a new `Suspend` instance in the Idle state. To begin
+    /// listening for notifications, use the `listen` or `try_listen` methods
+    /// to construct a [`Listener`].
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner::new(IDLE)),
         }
     }
 
-    pub fn block_on<F>(&mut self, fut: F) -> F::Output
-    where
-        F: Future,
-    {
-        pin_mut!(fut);
-        loop {
-            let waker = self.waker();
-            let mut cx = Context::from_waker(&waker);
-            let mut listen = self.listen();
-            match fut.as_mut().poll(&mut cx) {
-                Poll::Ready(result) => break result,
-                Poll::Pending => listen.wait(),
-            }
-        }
-    }
-
+    /// Construct a new `Notifier` instance associated with this `Suspend`.
     pub fn notifier(&self) -> Notifier {
         Notifier {
             inner: self.inner.clone(),
         }
     }
 
+    /// Directly notify the `Suspend` instance and call any
+    /// currently-associated waker.
     pub fn notify(&self) {
         self.inner.notify();
     }
 
+    /// Given a mutable reference to the `Suspend`, start listening for
+    /// a notification.
     pub fn listen(&mut self) -> Listener<'_> {
         self.inner.acquire().expect("Invalid Suspend state")
     }
 
+    /// Try to construct a `Listener` and start listening for notifications
+    /// when only a read-only reference to the `Suspend` is available.
     pub fn try_listen(&self) -> Option<Listener<'_>> {
         self.inner.acquire()
     }
 
+    /// Construct a new `Waker` associated with the `Suspend` instance.
     pub fn waker(&self) -> Waker {
         waker(self.inner.clone())
     }
@@ -377,19 +415,32 @@ impl Debug for Suspend {
     }
 }
 
+/// The result of acquiring a `Suspend` using either [`Suspend::listen`] or
+/// [`Suspend::try_listen`]. It may be used to wait for a notification using
+/// `await` or by parking the current thread.
 pub struct Listener<'a> {
     inner: &'a Arc<Inner>,
 }
 
 impl Listener<'_> {
+    /// Wait for a notification on the associated `Suspend` instance, parking
+    /// the current thread until that time.
     pub fn wait(&mut self) {
         self.inner.wait()
     }
 
+    /// Wait for a notification on the associated `Suspend` instance, parking
+    /// the current thread until the result is available or the deadline is
+    /// reached. If a timeout occurs then `false` is returned, otherwise
+    /// `true`.
     pub fn wait_deadline(&mut self, expire: Instant) -> bool {
         self.inner.wait_deadline(expire)
     }
 
+    /// Wait for a notification on the associated `Suspend` instance, parking
+    /// the current thread until the result is available or the timeout
+    /// expires. If a timeout does occur then `false` is returned, otherwise
+    /// `true`.
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
         self.inner.wait_timeout(timeout)
     }
@@ -409,16 +460,21 @@ impl<'a> Future for Listener<'a> {
     }
 }
 
+/// An instance of a notifier for a `Suspend` instance. When notified, the
+/// associated thread or `Future` will be woken if currently suspended.
 pub struct Notifier {
     inner: Arc<Inner>,
 }
 
 impl Notifier {
+    /// Notify the associated `Suspend` instance, calling its currently
+    /// associated waker, if any.
     pub fn notify(&self) {
         self.inner.notify();
     }
 
-    pub fn to_waker(self) -> Waker {
+    /// Convert the `Notifier` into a `Waker`.
+    pub fn into_waker(self) -> Waker {
         waker(self.inner)
     }
 }
@@ -431,29 +487,53 @@ impl Clone for Notifier {
     }
 }
 
+/// A polling function equivalent to `Future::poll`.
 pub type PollFn<'a, T> = Box<dyn FnMut(&mut Context) -> Poll<T> + Send + 'a>;
 
-#[must_use = "Task must be awaited"]
-pub enum Task<'t, T> {
+enum TaskState<'t, T> {
     Future(BoxFuture<'t, T>),
     Poll(PollFn<'t, T>),
 }
 
+impl<T> TaskState<'_, T> {
+    fn poll(&mut self, cx: &mut Context) -> Poll<T> {
+        match self {
+            Self::Future(fut) => fut.as_mut().poll(cx),
+            Self::Poll(poll) => poll(cx),
+        }
+    }
+}
+
+/// An asynchronous result which may be evaluated using `await`, or by using
+/// blocking operations with an optional timeout.
+#[must_use = "Task must be awaited"]
+pub struct Task<'t, T> {
+    state: TaskState<'t, T>,
+}
+
 impl<'t, T> Task<'t, T> {
+    /// Create a new `Task` from a function returning `Poll<T>`. If the
+    /// function is already boxed, then it would be more efficient to use
+    /// `Task::from`.
     pub fn from_poll<F>(f: F) -> Self
     where
         F: FnMut(&mut Context) -> Poll<T> + Send + 't,
     {
-        Self::Poll(Box::new(f))
+        Self::from(Box::new(f) as PollFn<'t, T>)
     }
 
+    /// Create a new `Task` from a `Future<T>`. If the future is already boxed,
+    /// then it would be more efficient to use `Task::from`.
     pub fn from_future<F>(f: F) -> Self
     where
         F: Future<Output = T> + Send + 't,
     {
-        Self::Future(f.boxed())
+        Self {
+            state: TaskState::Future(f.boxed()),
+        }
     }
 
+    /// Create a new `Task` from a result value.
     pub fn ready(result: T) -> Self
     where
         T: Send + 't,
@@ -468,22 +548,19 @@ impl<'t, T> Task<'t, T> {
         })
     }
 
-    pub fn map<'m, F, R>(mut self, f: F) -> Task<'m, R>
+    /// Map the result of the `Task` using a transformation function.
+    pub fn map<'m, F, R>(self, f: F) -> Task<'m, R>
     where
         F: Fn(T) -> R + Send + 'm,
         T: 'm,
         't: 'm,
     {
-        Task::from_poll(move |cx| Pin::new(&mut self).poll(cx).map(&f))
+        let mut state = self.state;
+        Task::from_poll(move |cx| state.poll(cx).map(&f))
     }
 
-    fn poll_inner(&mut self, cx: &mut Context) -> Poll<T> {
-        match &mut *self {
-            Self::Future(fut) => fut.as_mut().poll(cx),
-            Self::Poll(poll) => poll(cx),
-        }
-    }
-
+    /// Resolve the `Task` to its result, parking the current thread until
+    /// the result is available.
     pub fn wait(self) -> T {
         if let Ok(result) = self.wait_while(|listen| {
             listen.wait();
@@ -496,10 +573,16 @@ impl<'t, T> Task<'t, T> {
         }
     }
 
+    /// Resolve the `Task` to its result, parking the current thread until
+    /// the result is available or the deadline is reached. If a timeout occurs
+    /// then the `Err` result will contain the original `Task`.
     pub fn wait_deadline(self, expire: Instant) -> Result<T, Self> {
         self.wait_while(|listen| listen.wait_deadline(expire))
     }
 
+    /// Resolve the `Task` to its result, parking the current thread until
+    /// the result is available or the timeout expires. If a timeout does
+    /// occur then the `Err` result will contain the original `Task`.
     pub fn wait_timeout(self, timeout: Duration) -> Result<T, Self> {
         let expire = Instant::now() + timeout;
         self.wait_while(|listen| listen.wait_deadline(expire))
@@ -514,7 +597,7 @@ impl<'t, T> Task<'t, T> {
         let mut cx = Context::from_waker(&waker);
         let mut listen = sus.listen();
         loop {
-            match self.poll_inner(&mut cx) {
+            match self.state.poll(&mut cx) {
                 Poll::Ready(result) => break Ok(result),
                 Poll::Pending => {
                     if !test(&mut listen) {
@@ -523,6 +606,32 @@ impl<'t, T> Task<'t, T> {
                 }
             }
         }
+    }
+}
+
+impl<'t, T, E> Task<'t, Result<T, E>> {
+    /// A helper method to map the `Ok(T)` result of the `Task<Result<T, E>>`
+    /// using a transformation function.
+    pub fn map_ok<'m, F, R>(self, f: F) -> Task<'m, Result<R, E>>
+    where
+        F: Fn(T) -> R + Send + 'm,
+        T: 'm,
+        E: 'm,
+        't: 'm,
+    {
+        self.map(move |r| r.map(&f))
+    }
+
+    /// A helper method to map the `Err(E)` result of the `Task<Result<T, E>>`
+    /// using a transformation function.
+    pub fn map_err<'m, F, R>(self, f: F) -> Task<'m, Result<T, R>>
+    where
+        F: Fn(E) -> R + Send + 'm,
+        T: 'm,
+        E: 'm,
+        't: 'm,
+    {
+        self.map(move |r| r.map_err(&f))
     }
 }
 
@@ -542,13 +651,17 @@ impl<T> Eq for Task<'_, T> {}
 
 impl<'t, T> From<BoxFuture<'t, T>> for Task<'t, T> {
     fn from(fut: BoxFuture<'t, T>) -> Self {
-        Self::Future(fut)
+        Self {
+            state: TaskState::Future(fut),
+        }
     }
 }
 
 impl<'t, T> From<PollFn<'t, T>> for Task<'t, T> {
     fn from(poll: PollFn<'t, T>) -> Self {
-        Self::Poll(poll)
+        Self {
+            state: TaskState::Poll(poll),
+        }
     }
 }
 
@@ -556,25 +669,18 @@ impl<'t, T> Future for Task<'t, T> {
     type Output = T;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.poll_inner(cx)
+        self.state.poll(cx)
     }
 }
 
 #[cfg(feature = "oneshot")]
-impl<'t, T: Send + 't> Task<'t, T> {
-    pub fn oneshot() -> (oneshot::Sender<T>, Task<'t, Result<T, oneshot::RecvError>>) {
-        let (sender, receiver) = oneshot::channel();
-        (sender, Task::from(receiver))
-    }
-}
-
-#[cfg(feature = "oneshot")]
-impl<'t, T: Send + 't> From<oneshot::Receiver<T>> for Task<'t, Result<T, oneshot::RecvError>> {
+impl<'t, T: Send + 't> From<oneshot::Receiver<T>> for Task<'t, Result<T, RecvError>> {
     fn from(mut receiver: oneshot::Receiver<T>) -> Self {
         Task::from_poll(move |cx| Pin::new(&mut receiver).poll(cx))
     }
 }
 
+/// A polling function equivalent to `Stream::poll_next`.
 pub type PollNextFn<'a, T> = Box<dyn FnMut(&mut Context) -> Poll<Option<T>> + Send + 'a>;
 
 enum IterState<'s, T> {
@@ -591,6 +697,8 @@ impl<'s, T> IterState<'s, T> {
     }
 }
 
+/// An stream which may be polled asynchronously, or by using blocking
+/// operations with an optional timeout.
 #[must_use = "Iter must be awaited"]
 pub struct Iter<'s, T> {
     suspend: Option<Suspend>,
@@ -598,35 +706,38 @@ pub struct Iter<'s, T> {
 }
 
 impl<'s, T> Iter<'s, T> {
-    pub fn from_stream<S>(s: S) -> Self
-    where
-        S: Stream<Item = T> + Send + 's,
-    {
-        Self {
-            suspend: None,
-            state: IterState::Stream(s.boxed()),
-        }
-    }
-
+    /// Create a new `Iter` from a function returning `Poll<Option<T>>`. If
+    /// the function is already boxed, then it would be more efficent to use
+    /// `Iter::from`.
     pub fn from_poll_next<F>(f: F) -> Self
     where
         F: FnMut(&mut Context) -> Poll<Option<T>> + Send + 's,
     {
-        Self {
-            suspend: None,
-            state: IterState::PollNext(Box::new(f)),
-        }
+        Self::from(Box::new(f) as PollNextFn<'s, T>)
     }
 
-    pub fn map<'m, F, R>(mut self, f: F) -> Iter<'m, R>
+    /// Create a new `Iter` from a `Stream<T>`. If the stream is already boxed,
+    /// then it would be more efficent to use `Iter::from`.
+    pub fn from_stream<S>(s: S) -> Self
+    where
+        S: Stream<Item = T> + Send + 's,
+    {
+        Self::from(s.boxed())
+    }
+
+    /// Map the items of the `Iter` using a transformation function.
+    pub fn map<'m, F, R>(self, f: F) -> Iter<'m, R>
     where
         F: Fn(T) -> R + Send + 'm,
         T: 'm,
         's: 'm,
     {
-        Iter::from_poll_next(move |cx| Pin::new(&mut self).poll_next(cx).map(|opt| opt.map(&f)))
+        let mut state = self.state;
+        Iter::from_poll_next(move |cx| state.poll_next(cx).map(|opt| opt.map(&f)))
     }
 
+    /// Resolve the next item in the `Iter` stream, parking the current thread
+    /// until the result is available.
     pub fn wait_next(&mut self) -> Option<T> {
         self.wait_while(|listen| {
             listen.wait();
@@ -635,10 +746,16 @@ impl<'s, T> Iter<'s, T> {
         .unwrap()
     }
 
+    /// Resolve the next item in the `Iter` stream, parking the current thread
+    /// until the result is available or the deadline is reached. If a timeout
+    /// occurs then `Err(TimeoutError)` is returned.
     pub fn wait_next_deadline(&mut self, expire: Instant) -> Result<Option<T>, TimeoutError> {
         self.wait_while(|listen| listen.wait_deadline(expire))
     }
 
+    /// Resolve the next item in the `Iter` stream, parking the current thread
+    /// until the result is available or the timeout expires. If a timeout does
+    /// occur then `Err(TimeoutError)` is returned.
     pub fn wait_next_timeout(&mut self, timeout: Duration) -> Result<Option<T>, TimeoutError> {
         let expire = Instant::now() + timeout;
         self.wait_while(|listen| listen.wait_deadline(expire))
@@ -664,6 +781,41 @@ impl<'s, T> Iter<'s, T> {
                     }
                 }
             }
+        }
+    }
+}
+
+impl<'t, T, E> Iter<'t, Result<T, E>> {
+    /// A helper method to map the `Ok(T)` item of the `Iter<Result<T, E>>`
+    /// using a transformation function.
+    pub fn map_ok<'m, F, R>(self, f: F) -> Iter<'m, Result<R, E>>
+    where
+        F: Fn(T) -> R + Send + 'm,
+        T: 'm,
+        E: 'm,
+        't: 'm,
+    {
+        self.map(move |r| r.map(&f))
+    }
+
+    /// A helper method to map the `Err(E)` item of the `Iter<Result<T, E>>`
+    /// using a transformation function.
+    pub fn map_err<'m, F, R>(self, f: F) -> Iter<'m, Result<T, R>>
+    where
+        F: Fn(E) -> R + Send + 'm,
+        T: 'm,
+        E: 'm,
+        't: 'm,
+    {
+        self.map(move |r| r.map_err(&f))
+    }
+}
+
+impl<'s, T> From<BoxStream<'s, T>> for Iter<'s, T> {
+    fn from(stream: BoxStream<'s, T>) -> Self {
+        Self {
+            suspend: None,
+            state: IterState::Stream(stream),
         }
     }
 }
