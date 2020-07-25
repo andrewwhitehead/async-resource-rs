@@ -1,6 +1,6 @@
 [package]
 name = "suspend"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Andrew Whitehead <cywolf@gmail.com>"]
 edition = "2018"
 description = "A common mechanism for suspending a thread or a Future until notified"
@@ -8,14 +8,14 @@ license = "MIT/Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/andrewwhitehead/async-resource-rs/"
 categories = ["asynchronous", "concurrency", "data-structures"]
-keywords = ["park", "suspend", "thread", "waker", "oneshot"]
+keywords = ["park", "future", "stream", "thread", "waker"]
 
 [lib]
 name = "suspend"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["oneshot"]
 oneshot = ["oneshot_rs"]
 
 [dependencies]
@@ -23,5 +23,5 @@ futures-core = "0.3"
 futures-task = "0.3"
 oneshot_rs = { package = "oneshot", version = "0.1", optional = true }
 
-[dev-dependencies]
-suspend = { path = ".", features = ["oneshot"] }
+[[example]]
+name = "suspend"

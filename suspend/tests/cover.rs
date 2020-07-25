@@ -46,7 +46,7 @@ fn iter_poll_next() {
 }
 
 #[test]
-fn iter_stream() {
+fn iter_stream_basic() {
     struct OddStream(i32);
 
     impl Stream for OddStream {
@@ -65,12 +65,13 @@ fn iter_stream() {
         }
     }
 
-    let iter = Iter::from_stream(OddStream(1));
+    let iter = iter_stream(OddStream(1));
     assert_eq!(iter.take(3).collect::<Vec<i32>>(), vec![1, 3, 5]);
 }
 
+#[cfg(feature = "oneshot")]
 #[test]
-fn send_task() {
+fn sender_task_basic() {
     let (sender, task) = sender_task();
     sender.send(15).unwrap();
     assert_eq!(task.wait(), Ok(15));

@@ -1,5 +1,9 @@
 # suspend
 
+This crate provides various utilities for moving between async and synchronous contexts.
+It allows for a thread to easily block on a Future or Stream, and provides ways to
+suspend a Future until it is notified.
+
 ## Documentation
 
 You can read the docs [here][docs], or generate them on your own using `cargo doc`.

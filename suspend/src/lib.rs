@@ -1,3 +1,66 @@
+// Copyright 2020 Province of British Columbia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! This crate provides various utilities for moving between async and
+//! synchronous contexts.
+//!
+//! # Examples
+//!
+//! The [Task] structure allows a `Future` or a polling function to be
+//! evaluated in a blocking manner:
+//!
+//! ```
+//! use suspend::Task;
+//! use std::time::Duration;
+//!
+//! let task = Task::from_future(async { 100 }).map(|val| val * 2);
+//! assert_eq!(task.wait_timeout(Duration::from_secs(1)), Ok(200));
+//! ```
+//!
+//! Similarly, the [Iter] structure allows a `Stream` instance to be consumed
+//! in an async or blocking manner:
+//!
+//! ```
+//! use suspend::{Iter, block_on};
+//!
+//! let mut values = Iter::from_iterator(1..);
+//! assert_eq!(block_on(values.next()), Some(1));
+//! assert_eq!(values.take(3).collect::<Vec<_>>(), vec![2, 3, 4]);
+//! ```
+//!
+//! The [Suspend] structure may be used to coordinate between threads and
+//! `Futures`, allowing either to act as a waiter or notifier:
+//!
+//! ```
+//! use std::time::Duration;
+//! use suspend::{Suspend, block_on};
+//!
+//! let mut susp = Suspend::new();
+//! let notifier = susp.notifier();
+//!
+//! // start listening for notifications
+//! let mut listener = susp.listen();
+//! // send a notification (satisfies the current listener)
+//! notifier.notify();
+//! assert_eq!(listener.wait_timeout(Duration::from_secs(1)), true);
+//! drop(listener);
+//!
+//! let mut listener = susp.listen();
+//! notifier.notify();
+//! block_on(async { listener.await });
+//! ```
+
 use std::cell::UnsafeCell;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::future::Future;
@@ -61,6 +124,11 @@ pub fn notify_once<'a>() -> (Notifier, Task<'a, ()>) {
         inner: inner.clone(),
     };
     (notifier, Task::from_poll(move |cx| inner.poll(cx.waker())))
+}
+
+/// A convenience method to create a new `Task` from a result value.
+pub fn ready<'t, T: Send + 't>(result: T) -> Task<'t, T> {
+    Task::from_value(result)
 }
 
 #[cfg(feature = "oneshot")]
@@ -534,7 +602,7 @@ impl<'t, T> Task<'t, T> {
     }
 
     /// Create a new `Task` from a result value.
-    pub fn ready(result: T) -> Self
+    pub fn from_value(result: T) -> Self
     where
         T: Send + 't,
     {
@@ -697,7 +765,7 @@ impl<'s, T> IterState<'s, T> {
     }
 }
 
-/// An stream which may be polled asynchronously, or by using blocking
+/// A stream which may be polled asynchronously, or by using blocking
 /// operations with an optional timeout.
 #[must_use = "Iter must be awaited"]
 pub struct Iter<'s, T> {
@@ -718,6 +786,17 @@ impl<'s, T> Iter<'s, T> {
 
     /// Create a new `Iter` from a `Stream<T>`. If the stream is already boxed,
     /// then it would be more efficent to use `Iter::from`.
+    pub fn from_iterator<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = T> + 's,
+        <I as IntoIterator>::IntoIter: Send,
+    {
+        let mut iter = iter.into_iter();
+        Self::from_poll_next(move |_cx| Poll::Ready(iter.next()))
+    }
+
+    /// Create a new `Iter` from a `Stream<T>`. If the stream is already boxed,
+    /// then it would be more efficent to use `Iter::from`.
     pub fn from_stream<S>(s: S) -> Self
     where
         S: Stream<Item = T> + Send + 's,
@@ -734,6 +813,11 @@ impl<'s, T> Iter<'s, T> {
     {
         let mut state = self.state;
         Iter::from_poll_next(move |cx| state.poll_next(cx).map(|opt| opt.map(&f)))
+    }
+
+    /// Create a new future which resolves to the next item in the stream.
+    pub fn next(&mut self) -> Next<'_, 's, T> {
+        Next { iter: self }
     }
 
     /// Resolve the next item in the `Iter` stream, parking the current thread
@@ -829,6 +913,12 @@ impl<'s, T> From<PollNextFn<'s, T>> for Iter<'s, T> {
     }
 }
 
+impl<T> Debug for Iter<'_, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Iter({:p}", self)
+    }
+}
+
 impl<'s, T> Iterator for Iter<'s, T> {
     type Item = T;
 
@@ -837,10 +927,32 @@ impl<'s, T> Iterator for Iter<'s, T> {
     }
 }
 
+impl<T> PartialEq for Iter<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl<T> Eq for Iter<'_, T> {}
+
 impl<'s, T> Stream for Iter<'s, T> {
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.state.poll_next(cx)
+    }
+}
+
+/// A `Future` representing the next item in an [Iter] stream.
+#[derive(Debug)]
+pub struct Next<'n, 's, T> {
+    iter: &'n mut Iter<'s, T>,
+}
+
+impl<'n, 's, T> Future for Next<'n, 's, T> {
+    type Output = Option<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.iter.state.poll_next(cx)
     }
 }
