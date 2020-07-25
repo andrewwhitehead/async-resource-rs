@@ -11,12 +11,12 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use futures_util::{
+use futures_core::{
     future::BoxFuture,
     stream::{BoxStream, Stream},
-    task::{waker, ArcWake},
-    FutureExt, StreamExt,
+    // FutureExt, StreamExt,
 };
+use futures_task::{waker, ArcWake};
 
 #[cfg(feature = "oneshot")]
 pub use oneshot_rs as oneshot;
@@ -529,7 +529,7 @@ impl<'t, T> Task<'t, T> {
         F: Future<Output = T> + Send + 't,
     {
         Self {
-            state: TaskState::Future(f.boxed()),
+            state: TaskState::Future(Box::pin(f) as BoxFuture<'t, T>),
         }
     }
 
@@ -722,7 +722,7 @@ impl<'s, T> Iter<'s, T> {
     where
         S: Stream<Item = T> + Send + 's,
     {
-        Self::from(s.boxed())
+        Self::from(Box::pin(s) as BoxStream<'s, T>)
     }
 
     /// Map the items of the `Iter` using a transformation function.

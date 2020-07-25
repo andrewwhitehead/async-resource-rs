@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 
-use futures_util::stream::Stream;
+use futures_core::stream::Stream;
 
 use suspend::*;
 

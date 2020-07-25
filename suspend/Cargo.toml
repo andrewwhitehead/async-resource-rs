@@ -19,7 +19,8 @@ default = []
 oneshot = ["oneshot_rs"]
 
 [dependencies]
-futures-util = "0.3"
+futures-core = "0.3"
+futures-task = "0.3"
 oneshot_rs = { package = "oneshot", version = "0.1", optional = true }
 
 [dev-dependencies]
