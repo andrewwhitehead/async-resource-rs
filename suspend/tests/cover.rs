@@ -66,3 +66,10 @@ fn iter_stream() {
     let iter = Iter::from_stream(OddStream(1));
     assert_eq!(iter.take(3).collect::<Vec<i32>>(), vec![1, 3, 5]);
 }
+
+#[test]
+fn oneshot() {
+    let (sender, mut task) = Task::oneshot();
+    sender.send(15).unwrap();
+    assert_eq!(task.wait(), Ok(15));
+}

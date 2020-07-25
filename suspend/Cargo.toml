@@ -14,5 +14,13 @@ keywords = ["park", "suspend", "thread", "waker"]
 name = "suspend"
 path = "src/lib.rs"
 
+[features]
+default = []
+oneshot = ["oneshot_rs"]
+
 [dependencies]
 futures-util = "0.3"
+oneshot_rs = { package = "oneshot", version = "0.1", optional = true }
+
+[dev-dependencies]
+suspend = { path = ".", features = ["oneshot"] }

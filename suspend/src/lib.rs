@@ -19,6 +19,9 @@ use futures_util::{
     FutureExt, StreamExt,
 };
 
+#[cfg(feature = "oneshot")]
+pub use oneshot_rs as oneshot;
+
 // FIXME add Debug impl
 
 const IDLE: u8 = 0x0;
@@ -508,19 +511,28 @@ impl<'t, T> Task<'t, T> {
     }
 }
 
-impl<'f, T> From<BoxFuture<'f, T>> for Task<'f, T> {
-    fn from(fut: BoxFuture<'f, T>) -> Self {
+#[cfg(feature = "oneshot")]
+impl<'t, T: Send + 't> Task<'t, T> {
+    pub fn oneshot() -> (oneshot::Sender<T>, Task<'t, Result<T, oneshot::RecvError>>) {
+        let (sender, mut receiver) = oneshot::channel();
+        let task = Task::from_poll(move |cx| Pin::new(&mut receiver).poll(cx));
+        (sender, task)
+    }
+}
+
+impl<'t, T> From<BoxFuture<'t, T>> for Task<'t, T> {
+    fn from(fut: BoxFuture<'t, T>) -> Self {
         Self::Future(fut)
     }
 }
 
-impl<'f, T> From<PollFn<'f, T>> for Task<'f, T> {
-    fn from(poll: PollFn<'f, T>) -> Self {
+impl<'t, T> From<PollFn<'t, T>> for Task<'t, T> {
+    fn from(poll: PollFn<'t, T>) -> Self {
         Self::Poll(poll)
     }
 }
 
-impl<'f, T> Future for Task<'f, T> {
+impl<'t, T> Future for Task<'t, T> {
     type Output = T;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
