@@ -1,5 +1,5 @@
 use std::cell::UnsafeCell;
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter};
 use std::future::Future;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
@@ -473,24 +473,28 @@ impl<'t, T> Task<'t, T> {
         }
     }
 
-    pub fn wait(&mut self) -> T {
-        self.wait_while(|listen| {
+    pub fn wait(self) -> T {
+        if let Ok(result) = self.wait_while(|listen| {
             listen.wait();
             true
-        })
-        .unwrap()
+        }) {
+            result
+        } else {
+            // should not be possible
+            panic!("wait_while returned error");
+        }
     }
 
-    pub fn wait_deadline(&mut self, expire: Instant) -> Result<T, TimeoutError> {
+    pub fn wait_deadline(self, expire: Instant) -> Result<T, Self> {
         self.wait_while(|listen| listen.wait_deadline(expire))
     }
 
-    pub fn wait_timeout(&mut self, timeout: Duration) -> Result<T, TimeoutError> {
+    pub fn wait_timeout(self, timeout: Duration) -> Result<T, Self> {
         let expire = Instant::now() + timeout;
         self.wait_while(|listen| listen.wait_deadline(expire))
     }
 
-    fn wait_while<F>(&mut self, test: F) -> Result<T, TimeoutError>
+    fn wait_while<F>(mut self, test: F) -> Result<T, Self>
     where
         F: Fn(&mut Listener) -> bool,
     {
@@ -503,7 +507,7 @@ impl<'t, T> Task<'t, T> {
                 Poll::Ready(result) => break Ok(result),
                 Poll::Pending => {
                     if !test(&mut listen) {
-                        break Err(TimeoutError);
+                        break Err(self);
                     }
                 }
             }
@@ -519,6 +523,20 @@ impl<'t, T: Send + 't> Task<'t, T> {
         (sender, task)
     }
 }
+
+impl<T> Debug for Task<'_, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Task({:p}", self)
+    }
+}
+
+impl<T> PartialEq for Task<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl<T> Eq for Task<'_, T> {}
 
 impl<'t, T> From<BoxFuture<'t, T>> for Task<'t, T> {
     fn from(fut: BoxFuture<'t, T>) -> Self {

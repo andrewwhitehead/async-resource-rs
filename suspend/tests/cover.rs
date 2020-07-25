@@ -18,20 +18,17 @@ fn simple_timer<'a>(duration: Duration) -> Task<'a, ()> {
 
 #[test]
 fn task_map() {
-    let mut task = Task::from_future(async { 25 }).map(|x| x * 2);
+    let task = Task::from_future(async { 25 }).map(|x| x * 2);
     assert_eq!(task.wait(), 50);
 }
 
 #[test]
 fn task_wait_timeout() {
-    let mut task = simple_timer(Duration::from_millis(5));
+    let task = simple_timer(Duration::from_millis(5));
     assert!(task.wait_timeout(Duration::from_millis(100)).is_ok());
 
-    let mut task = simple_timer(Duration::from_millis(100));
-    assert_eq!(
-        task.wait_timeout(Duration::from_millis(5)),
-        Err(TimeoutError)
-    );
+    let task = simple_timer(Duration::from_millis(100));
+    assert!(task.wait_timeout(Duration::from_millis(5)).is_err(),);
 }
 
 #[test]
@@ -69,7 +66,7 @@ fn iter_stream() {
 
 #[test]
 fn oneshot() {
-    let (sender, mut task) = Task::oneshot();
+    let (sender, task) = Task::oneshot();
     sender.send(15).unwrap();
     assert_eq!(task.wait(), Ok(15));
 }
