@@ -1,17 +1,13 @@
 use std::fmt::{self, Debug, Formatter};
-use std::future::Future;
-use std::marker::PhantomData;
-use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::task::{Context, Poll};
 use std::thread;
 
-use dropshot::{channel, Receiver};
+use oneshot::{channel, Receiver};
 use option_lock::OptionLock;
-use suspend::Suspend;
+use suspend::{self, Notifier, Suspend};
 
 use super::sentinel::Sentinel;
 
@@ -21,38 +17,19 @@ pub enum Command<T> {
     Stop,
 }
 
-pub type Canceled = dropshot::Canceled;
+pub type Canceled = oneshot::RecvError;
 
-pub struct Task<'t, R> {
-    receiver: Receiver<R>,
-    _pd: PhantomData<&'t ()>,
-}
-
-impl<R> Task<'_, R> {
-    pub fn wait(mut self) -> Result<R, Canceled> {
-        self.receiver.recv()
-    }
-}
-
-impl<R> Future for Task<'_, R> {
-    type Output = Result<R, Canceled>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.receiver).poll(cx)
-    }
-}
+pub type Task<'t, R> = suspend::Task<'t, Result<R, Canceled>>;
 
 struct State<T> {
     pub next: OptionLock<Command<T>>,
-    pub suspend: Suspend,
     pub running: AtomicBool,
 }
 
 impl<T> State<T> {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             next: OptionLock::new(),
-            suspend: Suspend::new(),
             running: AtomicBool::new(true),
         }
     }
@@ -60,6 +37,7 @@ impl<T> State<T> {
 
 pub struct ThreadResource<T> {
     handle: Option<thread::JoinHandle<()>>,
+    notifier: Notifier,
     state: Arc<State<T>>,
 }
 
@@ -78,9 +56,11 @@ impl<T> ThreadResource<T> {
         E: Send + 'static,
         T: 'static,
     {
+        let mut suspend = Suspend::new();
+        let notifier = suspend.notifier();
         let state = Arc::new(State::new());
         let int_state = state.clone();
-        let (send_start, mut recv_start) = channel();
+        let (send_start, recv_start) = channel();
         let handle = Some(thread::spawn(move || {
             let state = Sentinel::new(int_state, |state, _| {
                 state.running.store(false, Ordering::Release);
@@ -89,16 +69,15 @@ impl<T> ThreadResource<T> {
                 Ok(res) => (Some(res), Ok(())),
                 Err(err) => (None, Err(err)),
             };
-            match send_start.send(start) {
-                Ok(()) => (),
-                Err(_) => return,
-            }
+            send_start
+                .send(start)
+                .expect("ThreadResource::try_create() receiver dropped");
             let mut res = match res {
                 Some(res) => res,
                 None => return,
             };
             loop {
-                let mut listen = state.suspend.try_listen().unwrap();
+                let mut listen = suspend.listen();
                 match state.next.try_take() {
                     Ok(Command::Run(f)) => {
                         f(&mut res);
@@ -111,13 +90,17 @@ impl<T> ThreadResource<T> {
                         break;
                     }
                     Err(_) => {
-                        listen.park();
+                        listen.wait();
                     }
                 }
             }
         }));
         recv_start.recv().unwrap()?;
-        Ok(Self { handle, state })
+        Ok(Self {
+            handle,
+            notifier,
+            state,
+        })
     }
 
     #[must_use]
@@ -126,38 +109,48 @@ impl<T> ThreadResource<T> {
         F: FnOnce(&mut T) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (sender, receiver) = channel();
+        let (sender, task) = suspend::Task::oneshot();
         self.run_command(Command::Run(Box::new(|res| {
             sender.send(f(res)).unwrap_or(())
         })));
-        Task {
-            receiver,
-            _pd: PhantomData,
-        }
+        task
     }
 
+    #[must_use]
     pub fn extract(mut self) -> Receiver<T>
     where
         T: Send + 'static,
     {
-        let (sender, recv) = channel();
+        let (sender, receiver) = channel();
         self.run_command(Command::Extract(Box::new(|res| {
-            sender.send(res).unwrap_or(())
+            sender
+                .send(res)
+                .expect("ThreadResource::extract() receiver dropped");
         })));
-        recv
+        // skip Stop procedure
+        self.handle.take();
+        receiver
     }
 
-    fn run_command(&mut self, cmd: Command<T>) {
-        // only contention is with the command thread, which only locks
-        // long enough to retrieve the value
+    fn run_command(&mut self, cmd: Command<T>) -> bool {
+        // only contention should be with the executor thread, which locks
+        // just long enough to retrieve the value
         let mut guard = self.state.next.spin_lock();
-        if self.state.running.load(Ordering::Acquire) {
+        let ret = if self.state.running.load(Ordering::Acquire) && guard.is_none() {
             guard.replace(cmd);
-        }
-        // if the thread stopped unexpectedly then the task is dropped,
-        // which generally causes a Sender to be cancelled
+            true
+        } else {
+            // if the thread stopped unexpectedly then the task is dropped,
+            // which generally causes a Sender to be cancelled.
+            // if the previous Task is not consumed then there could also be
+            // a Command in the queue. return false but wake the executor
+            // thread in case it failed to acquire the lock while we were
+            // holding it.
+            false
+        };
         drop(guard);
-        self.state.suspend.notify();
+        self.notifier.notify();
+        ret
     }
 }
 

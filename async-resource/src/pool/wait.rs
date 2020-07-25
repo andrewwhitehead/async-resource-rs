@@ -2,13 +2,13 @@ use std::fmt::{self, Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use dropshot;
+use oneshot;
 use option_lock::OptionLock;
 
-pub use self::dropshot::Canceled;
+pub use self::oneshot::RecvError as Canceled;
 
 pub fn waiter_pair<T>() -> (WaitResponder<T>, Waiter<T>) {
-    let (sender, receiver) = dropshot::channel();
+    let (sender, receiver) = oneshot::channel();
     (
         WaitResponder {
             sender: Arc::new(OptionLock::from(sender)),
@@ -18,7 +18,7 @@ pub fn waiter_pair<T>() -> (WaitResponder<T>, Waiter<T>) {
 }
 
 pub struct WaitResponder<T> {
-    sender: Arc<OptionLock<dropshot::Sender<T>>>,
+    sender: Arc<OptionLock<oneshot::Sender<T>>>,
 }
 
 impl<T> WaitResponder<T> {
@@ -34,7 +34,7 @@ impl<T> WaitResponder<T> {
 
     pub fn send(self, resolve: T) -> Result<(), T> {
         if let Ok(sender) = self.sender.try_take() {
-            sender.send(resolve)
+            sender.send(resolve).map_err(|e| e.into_inner())
         } else {
             Err(resolve)
         }
@@ -58,7 +58,7 @@ impl<T> Debug for WaitResponder<T> {
 }
 
 pub struct Waiter<T> {
-    receiver: dropshot::Receiver<T>,
+    receiver: oneshot::Receiver<T>,
 }
 
 impl<T> Debug for Waiter<T> {
@@ -68,7 +68,7 @@ impl<T> Debug for Waiter<T> {
 }
 
 impl<T> Deref for Waiter<T> {
-    type Target = dropshot::Receiver<T>;
+    type Target = oneshot::Receiver<T>;
     fn deref(&self) -> &Self::Target {
         &self.receiver
     }

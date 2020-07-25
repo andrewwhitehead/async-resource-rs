@@ -20,11 +20,11 @@ multitask-exec = ["multitask"]
 
 [dependencies]
 concurrent-queue = "1.1"
-dropshot = { version = "0.1", path = "../dropshot" }
 futures-util = "0.3"
 multitask = { version = "0.2", optional = true }
+oneshot = "0.1.1"
 option-lock = { version = "0.1", path = "../option-lock" }
-suspend = { version = "0.1", path = "../suspend" }
+suspend = { version = "0.1", path = "../suspend", features = ["oneshot"] }
 
 [dev-dependencies]
 criterion = "0.3"

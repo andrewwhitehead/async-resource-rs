@@ -10,9 +10,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use concurrent_queue::ConcurrentQueue;
-
 use futures_util::FutureExt;
-
 use suspend::{Notifier, Suspend};
 
 use crate::resource::{ResourceGuard, ResourceInfo, ResourceLock};
@@ -281,9 +279,9 @@ impl<T: Send, E> PoolInternal<T, E> {
             }
 
             if let Some(next_check) = next_check {
-                listener.park_until(next_check);
+                listener.wait_deadline(next_check);
             } else {
-                listener.park();
+                listener.wait();
             }
             next_check = None;
         }

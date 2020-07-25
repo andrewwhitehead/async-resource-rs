@@ -50,7 +50,7 @@ mod multitask_exec {
                                 if !running.load(Ordering::Acquire) {
                                     break;
                                 }
-                                listener.park();
+                                listener.wait();
                             }
                         }),
                         parent_notifier,
