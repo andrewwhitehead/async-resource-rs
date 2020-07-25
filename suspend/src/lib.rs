@@ -515,15 +515,6 @@ impl<'t, T> Task<'t, T> {
     }
 }
 
-#[cfg(feature = "oneshot")]
-impl<'t, T: Send + 't> Task<'t, T> {
-    pub fn oneshot() -> (oneshot::Sender<T>, Task<'t, Result<T, oneshot::RecvError>>) {
-        let (sender, mut receiver) = oneshot::channel();
-        let task = Task::from_poll(move |cx| Pin::new(&mut receiver).poll(cx));
-        (sender, task)
-    }
-}
-
 impl<T> Debug for Task<'_, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "Task({:p}", self)
@@ -555,6 +546,21 @@ impl<'t, T> Future for Task<'t, T> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.poll_inner(cx)
+    }
+}
+
+#[cfg(feature = "oneshot")]
+impl<'t, T: Send + 't> Task<'t, T> {
+    pub fn oneshot() -> (oneshot::Sender<T>, Task<'t, Result<T, oneshot::RecvError>>) {
+        let (sender, receiver) = oneshot::channel();
+        (sender, Task::from(receiver))
+    }
+}
+
+#[cfg(feature = "oneshot")]
+impl<'t, T: Send + 't> From<oneshot::Receiver<T>> for Task<'t, Result<T, oneshot::RecvError>> {
+    fn from(mut receiver: oneshot::Receiver<T>) -> Self {
+        Task::from_poll(move |cx| Pin::new(&mut receiver).poll(cx))
     }
 }
 
