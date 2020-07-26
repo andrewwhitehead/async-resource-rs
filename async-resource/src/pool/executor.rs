@@ -114,14 +114,14 @@ mod multitask_exec {
 pub use multitask_exec::MultitaskExecutor;
 
 #[cfg(feature = "multitask-exec")]
-/// Returns a default `Executor` instance to use when constructing a resource
+/// Returns a default [`Executor`] instance to use when constructing a resource
 /// pool.
 pub fn default_executor() -> Result<Box<dyn Executor>, ConfigError> {
     Ok(Box::new(multitask_exec::MultitaskExecutor::global()))
 }
 
 #[cfg(not(any(feature = "multitask-exec")))]
-/// Returns a default `Executor` instance to use when constructing a resource
+/// Returns a default [`Executor`] instance to use when constructing a resource
 /// pool.
 pub fn default_executor() -> Result<Box<dyn Executor>, ConfigError> {
     Err(ConfigError("No default executor is provided"))

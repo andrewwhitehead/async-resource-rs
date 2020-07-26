@@ -6,7 +6,7 @@ use option_lock::OptionLock;
 
 pub use suspend::Incomplete as Canceled;
 
-pub fn waiter_pair<T: 'static>() -> (WaitResponder<T>, Waiter<T>) {
+pub fn waiter_pair<T: Send + 'static>() -> (WaitResponder<T>, Waiter<T>) {
     let (sender, receiver) = suspend::channel();
     (
         WaitResponder {

@@ -10,14 +10,16 @@ use suspend::{channel, Notifier, Suspend};
 
 use super::sentinel::Sentinel;
 
-pub enum Command<T> {
+enum Command<T> {
     Run(Box<dyn FnOnce(&mut T) + Send>),
     Extract(Box<dyn FnOnce(T) + Send>),
     Stop,
 }
 
+/// The error returned when a `Task` fails to complete.
 pub type Canceled = suspend::Incomplete;
 
+/// The error returned when a `Task` fails to complete.
 pub type Task<'t, R> = suspend::Task<'t, Result<R, Canceled>>;
 
 struct State<T> {
@@ -34,6 +36,8 @@ impl<T> State<T> {
     }
 }
 
+/// A dedicated thread managing interaction with a resource. It can serve as
+/// a handle for working with a `!Send` resource.
 pub struct ThreadResource<T> {
     handle: Option<thread::JoinHandle<()>>,
     notifier: Notifier,
@@ -41,6 +45,7 @@ pub struct ThreadResource<T> {
 }
 
 impl<T> ThreadResource<T> {
+    /// Create a new instance from a constructor.
     pub fn create<F>(ctor: F) -> Self
     where
         F: FnOnce() -> T + Send + 'static,
@@ -49,6 +54,8 @@ impl<T> ThreadResource<T> {
         Self::try_create(|| Result::<T, ()>::Ok(ctor())).unwrap()
     }
 
+    /// Create a new instance from a fallible constructor, returning the
+    /// resulting error if the constructor fails.
     pub fn try_create<F, E>(ctor: F) -> Result<Self, E>
     where
         F: FnOnce() -> Result<T, E> + Send + 'static,
@@ -102,6 +109,9 @@ impl<T> ThreadResource<T> {
         })
     }
 
+    /// Perform an action on the contained resource, returning a `Task`
+    /// representing the result of the computation. This result may be
+    /// awaited as a `Future` or resolved using `wait` or `wait_timeout`.
     #[must_use]
     pub fn enter<F, R>(&mut self, f: F) -> Task<'_, R>
     where
@@ -115,19 +125,20 @@ impl<T> ThreadResource<T> {
         task
     }
 
+    /// Consume the contained resource and shut down the thread.
     #[must_use]
-    pub fn extract<'a>(mut self) -> Task<'a, T>
+    pub fn extract<'a, F, R>(mut self, f: F) -> Task<'a, R>
     where
-        T: Send + 'static,
+        F: FnOnce(T) -> R + Send + 'static,
+        R: Send + 'static,
     {
         let (sender, receiver) = channel();
         self.run_command(Command::Extract(Box::new(|res| {
-            if sender.send(res).is_err() {
+            if sender.send(f(res)).is_err() {
                 panic!("ThreadResource::extract() receiver dropped");
             }
         })));
-        // skip Stop procedure
-        self.handle.take();
+        self.handle.take(); // skip Stop procedure
         receiver
     }
 
@@ -171,11 +182,19 @@ impl<T> Drop for ThreadResource<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
 
     #[test]
     fn thread_resource_basic() {
         let mut res = ThreadResource::create(|| 100u32);
         res.enter(|i| *i += 1).wait().unwrap();
-        assert_eq!(res.extract().wait(), Ok(101));
+        assert_eq!(res.extract(|res| res).wait(), Ok(101));
+    }
+
+    #[test]
+    fn thread_resource_not_send() {
+        let mut res = ThreadResource::create(|| Rc::new(100u32));
+        res.enter(|i| *Rc::get_mut(i).unwrap() += 1).wait().unwrap();
+        assert_eq!(res.extract(|i| Rc::try_unwrap(i).unwrap()).wait(), Ok(101));
     }
 }

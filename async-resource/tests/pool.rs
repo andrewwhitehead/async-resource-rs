@@ -3,8 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-//use suspend::block_on;
-use futures_executor::block_on;
+use suspend::block_on;
 
 use async_resource::{AcquireError, PoolConfig};
 
@@ -102,9 +101,7 @@ fn test_pool_not_sync() {
     })
     .build()
     .unwrap();
-    block_on(async move {
-        assert_eq!(pool.acquire().await.unwrap().get(), 1);
-    });
+    assert_eq!(pool.acquire().wait().unwrap().get(), 1);
 }
 
 #[test]
@@ -117,25 +114,20 @@ fn test_pool_waiter() {
     let mut waiters = 3;
 
     // load first resource
-    results
-        .lock()
-        .unwrap()
-        .push(block_on(async move { p1.acquire().await.unwrap() }));
+    results.lock().unwrap().push(p1.acquire().wait().unwrap());
 
     // create waiters for the resource
     for _ in 0..waiters {
         let pool = pool.clone();
         let results = results.clone();
         let waiting = waiting.clone();
-        thread::spawn(|| {
-            block_on(async move {
-                let wait = pool.acquire();
-                waiting.increment();
-                let result = wait.await;
-                // intentionally poison mutex on failure (acquire timeout)
-                results.lock().unwrap().push(result.unwrap());
-                waiting.decrement();
-            })
+        thread::spawn(move || {
+            let acquire = pool.acquire();
+            waiting.increment();
+            let result = acquire.wait();
+            // intentionally poison mutex on failure (acquire timeout)
+            results.lock().unwrap().push(result.unwrap());
+            waiting.decrement();
         });
     }
 
@@ -186,10 +178,7 @@ fn test_pool_max_waiters() {
     let p1 = pool.clone();
 
     // load first resource
-    results
-        .lock()
-        .unwrap()
-        .push(block_on(async move { p1.acquire().await.unwrap() }));
+    results.lock().unwrap().push(p1.acquire().wait().unwrap());
 
     // create waiters for the resource
     for _ in 0..3 {
@@ -198,23 +187,21 @@ fn test_pool_max_waiters() {
         let done = done.clone();
         let wait = wait.clone();
         let results = results.clone();
-        thread::spawn(|| {
-            block_on(async move {
-                let acquire = pool.acquire();
-                wait.increment();
-                let result = match acquire.await {
-                    Ok(result) => Ok(result),
-                    Err(AcquireError::PoolBusy) => {
-                        busy.increment();
-                        done.increment();
-                        return;
-                    }
-                    Err(other) => Err(other),
-                };
-                // intentionally poison mutex on failure (acquire timeout, resource error)
-                done.increment();
-                results.lock().unwrap().push(result.unwrap());
-            })
+        thread::spawn(move || {
+            let acquire = pool.acquire();
+            wait.increment();
+            let result = match acquire.wait() {
+                Ok(result) => Ok(result),
+                Err(AcquireError::PoolBusy) => {
+                    busy.increment();
+                    done.increment();
+                    return;
+                }
+                Err(other) => Err(other),
+            };
+            // intentionally poison mutex on failure (acquire timeout, resource error)
+            done.increment();
+            results.lock().unwrap().push(result.unwrap());
         });
     }
 

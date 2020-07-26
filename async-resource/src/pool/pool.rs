@@ -17,7 +17,7 @@ use crate::resource::{ResourceGuard, ResourceInfo, ResourceLock};
 use crate::shared::{DisposeFn, ReleaseFn, Shared, SharedEvent};
 use crate::util::sentinel::Sentinel;
 
-use super::acquire::Acquire;
+use super::acquire;
 use super::executor::Executor;
 use super::operation::{ResourceFuture, ResourceOperation, ResourceResolve};
 use super::wait::{waiter_pair, WaitResponder, Waiter};
@@ -447,7 +447,7 @@ impl<T: Send, E> PoolInternal<T, E> {
     }
 }
 
-/// A resource pool instance, which manages acquisition of managed resources
+/// A resource pool instance, which handles acquisition of managed resources
 /// of type `T`.
 pub struct Pool<T: Send + 'static, E: 'static> {
     pub(crate) inner: Sentinel<PoolInternal<T, E>>,
@@ -469,8 +469,8 @@ impl<T: Send, E> Pool<T, E> {
     /// Returns an `Acquire<T, E>` which is a `Future` that resolves to either
     /// a `Managed<T>` wrapper around an acquired resource, or an
     /// `AcquireError<E>`.
-    pub fn acquire(&self) -> Acquire<T, E> {
-        Acquire::new(self.clone())
+    pub fn acquire(&self) -> acquire::Acquire<T, E> {
+        acquire::acquire(self.clone())
     }
 
     /// Fetch the current number of allocated resources for this `Pool`

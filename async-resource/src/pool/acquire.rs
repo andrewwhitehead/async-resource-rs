@@ -1,8 +1,9 @@
-use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Poll;
 use std::time::Instant;
+
+use suspend::Task;
 
 use super::error::AcquireError;
 use super::operation::ResourceResolve;
@@ -10,34 +11,20 @@ use super::pool::Pool;
 use super::wait::Waiter;
 use crate::resource::Managed;
 
+pub type Acquire<T, E> = Task<'static, Result<Managed<T>, AcquireError<E>>>;
+
 enum AcquireState<T: Send + 'static, E: 'static> {
     Init,
     Resolve(ResourceResolve<T, E>),
     Waiting(Waiter<ResourceResolve<T, E>>),
 }
 
-/// A Future resolving to a `Managed<T>` or an `AcquireError`.
-pub struct Acquire<T: Send + 'static, E: 'static> {
-    pool: Pool<T, E>,
-    start: Instant,
-    state: Option<AcquireState<T, E>>,
-}
+pub fn acquire<T: Send + 'static, E: 'static>(pool: Pool<T, E>) -> Acquire<T, E> {
+    let start = Instant::now();
+    let mut save_state = Some(AcquireState::Init);
 
-impl<T: Send, E> Acquire<T, E> {
-    pub fn new(pool: Pool<T, E>) -> Self {
-        Self {
-            pool,
-            start: Instant::now(),
-            state: Some(AcquireState::Init),
-        }
-    }
-}
-
-impl<T: Send, E: Debug> Future for Acquire<T, E> {
-    type Output = Result<Managed<T>, AcquireError<E>>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = match self.state.take() {
+    Task::from_poll(move |cx| {
+        let mut state = match save_state.take() {
             Some(state) => state,
             None => {
                 // future already completed
@@ -51,15 +38,15 @@ impl<T: Send, E: Debug> Future for Acquire<T, E> {
                     // FIXME check timer since we may return here after a failure
 
                     // Try to acquire from the idle queue
-                    let mut resolve = self.pool.inner.try_acquire_idle();
+                    let mut resolve = pool.inner.try_acquire_idle();
                     if resolve.is_empty() {
                         // Queue is empty, try to create a new resource
-                        resolve = self.pool.inner.try_create();
+                        resolve = pool.inner.try_create();
                     }
 
                     if resolve.is_empty() {
                         // Register a waiter
-                        if let Some(waiter) = self.pool.inner.try_wait(self.start) {
+                        if let Some(waiter) = pool.inner.try_wait(start) {
                             AcquireState::Waiting(waiter)
                         } else {
                             return Poll::Ready(Err(AcquireError::PoolBusy));
@@ -73,18 +60,18 @@ impl<T: Send, E: Debug> Future for Acquire<T, E> {
                 AcquireState::Resolve(mut resolve) => match Pin::new(&mut resolve).poll(cx) {
                     Poll::Pending => {
                         // FIXME check timer (need to register one)
-                        self.state.replace(AcquireState::Resolve(resolve));
+                        save_state.replace(AcquireState::Resolve(resolve));
                         return Poll::Pending;
                     }
                     Poll::Ready(Some(Ok(guard))) => {
                         if guard.info().expired {
-                            self.pool.inner.shared().release(guard);
+                            pool.inner.shared().release(guard);
                             // retry
                             AcquireState::Init
                         } else {
                             return Poll::Ready(Ok(Managed::new(
                                 guard,
-                                self.pool.inner.shared().clone(),
+                                pool.inner.shared().clone(),
                             )));
                         }
                     }
@@ -99,7 +86,7 @@ impl<T: Send, E: Debug> Future for Acquire<T, E> {
 
                 AcquireState::Waiting(mut waiter) => match Pin::new(&mut *waiter).poll(cx) {
                     Poll::Pending => {
-                        self.state.replace(AcquireState::Waiting(waiter));
+                        save_state.replace(AcquireState::Waiting(waiter));
                         return Poll::Pending;
                     }
                     Poll::Ready(result) => match result {
@@ -109,5 +96,5 @@ impl<T: Send, E: Debug> Future for Acquire<T, E> {
                 },
             };
         }
-    }
+    })
 }
