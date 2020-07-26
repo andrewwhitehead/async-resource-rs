@@ -23,7 +23,7 @@ fn block_simple() {
 
 #[test]
 fn task_map() {
-    let task = Task::from_future(async { 25 }).map(|x| x * 2);
+    let task = Task::from_fut(async { 25 }).map(|x| x * 2);
     assert_eq!(task.wait(), 50);
 }
 
@@ -69,10 +69,9 @@ fn iter_stream_basic() {
     assert_eq!(iter.take(3).collect::<Vec<i32>>(), vec![1, 3, 5]);
 }
 
-#[cfg(feature = "oneshot")]
 #[test]
-fn sender_task_basic() {
-    let (sender, task) = sender_task();
+fn channel_basic() {
+    let (sender, task) = channel();
     sender.send(15).unwrap();
     assert_eq!(task.wait(), Ok(15));
 }

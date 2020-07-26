@@ -1,6 +1,6 @@
 [package]
 name = "suspend"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["Andrew Whitehead <cywolf@gmail.com>"]
 edition = "2018"
 description = "A common mechanism for suspending a thread or a Future until notified"
@@ -14,15 +14,19 @@ keywords = ["park", "future", "stream", "thread", "waker"]
 name = "suspend"
 path = "src/lib.rs"
 
-[features]
-default = ["oneshot"]
-oneshot = ["oneshot_rs"]
-
 [dependencies]
 futures-core = "0.3"
 futures-task = "0.3"
-oneshot_rs = { package = "oneshot", version = "0.1", optional = true }
 pin-utils = "0.1"
+
+[dev-dependencies]
+criterion = "0.3"
+futures-channel = "0.3"
+oneshot_rs = { package = "oneshot", version = "0.1" }
 
 [[example]]
 name = "suspend"
+
+[[bench]]
+name = "telephone"
+harness = false
