@@ -38,7 +38,6 @@ pub(crate) struct PoolManageState<T: Send + 'static, E: 'static> {
     create: BoxedOperation<T, E>,
     executor: Box<dyn Executor>,
     handle_error: Option<ErrorFn<E>>,
-    max_waiters: Option<usize>,
     register_inject: ConcurrentQueue<Register<T, E>>,
     state: AtomicU8,
     verify: Option<BoxedOperation<T, E>>,
@@ -70,6 +69,7 @@ impl<T: Send, E> PoolInternal<T, E> {
             on_dispose,
             min_count,
             max_count,
+            max_waiters,
             idle_timeout,
         );
         let manage = PoolManageState {
@@ -77,7 +77,6 @@ impl<T: Send, E> PoolInternal<T, E> {
             create,
             executor,
             handle_error,
-            max_waiters,
             register_inject: ConcurrentQueue::unbounded(),
             state: AtomicU8::new(ACTIVE),
             verify,
@@ -134,6 +133,7 @@ impl<T: Send, E> PoolInternal<T, E> {
         let mut timer_id_source: usize = 0;
         let mut timers = BTreeMap::<(Instant, usize), Timer<T, E>>::new();
         let mut waiters = VecDeque::<WaitResource<T, E>>::new();
+        let mut upd_waiter_count = None;
 
         loop {
             let remain_timers = timers.split_off(&(Instant::now(), 0));
@@ -187,8 +187,8 @@ impl<T: Send, E> PoolInternal<T, E> {
                 next_check = Some(next_check.map_or(fst.0, |t| std::cmp::min(t, fst.0)))
             }
 
-            // Set the waiter state to Idle.
-            // If anything is subsequently added to the queues, it will move to Busy.
+            // Set the waiter state to Wait.
+            // If anything is subsequently added to the queues, it will move to Idle.
             let mut listener = suspend.listen();
 
             while let Some(event) = inner.shared.pop_event() {
@@ -212,31 +212,30 @@ impl<T: Send, E> PoolInternal<T, E> {
                         drain_count += 1;
                     }
                     Register::Waiter(start, waiter) => {
-                        if let Some(expire) =
-                            inner.manage.acquire_timeout.clone().map(|dur| start + dur)
-                        {
-                            timer_id_source += 1;
-                            timers.insert((expire, timer_id_source), Timer::Waiter(waiter.clone()));
+                        if waiter.is_canceled() {
+                        } else {
+                            if let Some(expire) =
+                                inner.manage.acquire_timeout.clone().map(|dur| start + dur)
+                            {
+                                timer_id_source += 1;
+                                timers.insert(
+                                    (expire, timer_id_source),
+                                    Timer::Waiter(waiter.clone()),
+                                );
+                            }
+                            waiters.push_back(waiter);
                         }
-                        waiters.push_back(waiter);
                     }
                 }
             }
 
-            if waiters.is_empty() {
-                // FIXME dispose idle resources over min_count
-                // because 'busy' allows them to return to the idle queue
-                inner.shared.set_busy(false);
-            } else {
-                // This triggers released resources to go to the idle queue even when
-                // there is no idle timeout, and prevents subsequent acquires from stealing
-                // directly from the idle queue so that the waiters are completed first
-                inner.shared.set_busy(true);
-
+            upd_waiter_count.take();
+            if !waiters.is_empty() {
                 if inner.shared.have_idle() || inner.create_from_count().is_some() {
                     let mut res = None;
                     while let Some(waiter) = waiters.pop_front() {
                         if waiter.is_canceled() {
+                            upd_waiter_count.replace(inner.shared.decrement_waiters());
                             continue;
                         }
                         // Bypasses busy check because we are satisfying waiters
@@ -246,6 +245,7 @@ impl<T: Send, E> PoolInternal<T, E> {
                             {
                                 res = failed.take_resource()
                             }
+                            upd_waiter_count.replace(inner.shared.decrement_waiters());
                         } else {
                             // Return waiter, no resources available
                             waiters.push_front(waiter);
@@ -258,6 +258,10 @@ impl<T: Send, E> PoolInternal<T, E> {
                     }
                 }
             }
+
+            // FIXME when waiter_count returns to zero, dispose idle resources
+            // over min_count because 'busy' allows them to return to the idle
+            // queue
 
             let state = inner.manage.state.load(Ordering::Acquire);
             if state == DRAIN {
@@ -420,11 +424,15 @@ impl<T: Send, E> PoolInternal<T, E> {
         }
     }
 
-    pub fn try_wait(self: &Arc<Self>, started: Instant) -> Waiter<ResourceResolve<T, E>> {
-        let (send, receive) = waiter_pair();
-        self.register(Register::Waiter(started, send));
-        self.shared.notify();
-        receive
+    pub fn try_wait(self: &Arc<Self>, started: Instant) -> Option<Waiter<ResourceResolve<T, E>>> {
+        if self.shared.try_increment_waiters().is_some() {
+            let (send, receive) = waiter_pair();
+            self.register(Register::Waiter(started, send));
+            self.shared.notify();
+            Some(receive)
+        } else {
+            None
+        }
     }
 
     pub fn verify_or_dispose(self: &Arc<Self>, guard: ResourceGuard<T>) {

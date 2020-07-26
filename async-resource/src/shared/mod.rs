@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use concurrent_queue::ConcurrentQueue;
@@ -15,7 +15,6 @@ pub enum SharedEvent<T> {
 }
 
 pub struct Shared<T> {
-    busy: AtomicBool,
     count: AtomicUsize,
     dispose_count: AtomicUsize,
     event_queue: ConcurrentQueue<SharedEvent<T>>,
@@ -23,9 +22,11 @@ pub struct Shared<T> {
     idle_timeout: Option<Duration>,
     max_count: usize,
     min_count: usize,
+    max_waiters: Option<usize>,
     notifier: Notifier,
     on_dispose: Option<DisposeFn<T>>,
     on_release: Option<ReleaseFn<T>>,
+    waiter_count: AtomicUsize,
 }
 
 impl<T> Shared<T> {
@@ -35,10 +36,10 @@ impl<T> Shared<T> {
         on_dispose: Option<DisposeFn<T>>,
         min_count: usize,
         max_count: usize,
+        max_waiters: Option<usize>,
         idle_timeout: Option<Duration>,
     ) -> Self {
         Self {
-            busy: AtomicBool::new(false),
             count: AtomicUsize::new(0),
             dispose_count: AtomicUsize::new(0),
             event_queue: ConcurrentQueue::unbounded(),
@@ -46,9 +47,11 @@ impl<T> Shared<T> {
             idle_timeout,
             max_count,
             min_count,
+            max_waiters,
             notifier,
             on_dispose,
             on_release,
+            waiter_count: AtomicUsize::new(0),
         }
     }
 
@@ -80,7 +83,7 @@ impl<T> Shared<T> {
         if guard.is_some()
             && !guard.info().expired
             && (guard.info().reusable
-                || self.busy.load(Ordering::Acquire)
+                || self.is_busy()
                 || (min_count > 0 && self.count() <= min_count))
         {
             if let Some(check) = self.on_release.as_ref() {
@@ -107,7 +110,7 @@ impl<T> Shared<T> {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::Acquire)
+        self.waiter_count.load(Ordering::Acquire) > 0
     }
 
     pub fn max_count(&self) -> usize {
@@ -116,6 +119,10 @@ impl<T> Shared<T> {
 
     pub fn min_count(&self) -> usize {
         self.min_count
+    }
+
+    pub fn max_waiters(&self) -> Option<usize> {
+        self.max_waiters.clone()
     }
 
     pub fn notify(&self) {
@@ -163,10 +170,6 @@ impl<T> Shared<T> {
         }
     }
 
-    pub fn set_busy(&self, busy: bool) -> bool {
-        self.busy.swap(busy, Ordering::Release)
-    }
-
     pub fn try_acquire_idle(&self) -> Option<ResourceGuard<T>> {
         while let Ok(res) = self.idle_queue.pop() {
             // FIXME limit the number of attempts to avoid blocking in async?
@@ -189,5 +192,32 @@ impl<T> Shared<T> {
     pub fn try_update_count(&self, prev_count: usize, count: usize) -> Result<usize, usize> {
         self.count
             .compare_exchange_weak(prev_count, count, Ordering::SeqCst, Ordering::Acquire)
+    }
+
+    pub fn try_increment_waiters(&self) -> Option<usize> {
+        let mut count = self.waiter_count.load(Ordering::Acquire);
+        loop {
+            if self.max_waiters().map(|w| w > count).unwrap_or(true) {
+                match self.waiter_count.compare_exchange_weak(
+                    count,
+                    count + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        break Some(count + 1);
+                    }
+                    Err(c) => {
+                        count = c;
+                    }
+                }
+            } else {
+                break None;
+            }
+        }
+    }
+
+    pub fn decrement_waiters(&self) -> usize {
+        self.waiter_count.fetch_sub(1, Ordering::AcqRel) - 1
     }
 }

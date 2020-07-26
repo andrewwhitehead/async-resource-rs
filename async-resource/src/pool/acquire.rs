@@ -59,8 +59,11 @@ impl<T: Send, E: Debug> Future for Acquire<T, E> {
 
                     if resolve.is_empty() {
                         // Register a waiter
-                        let waiter = self.pool.inner.try_wait(self.start);
-                        AcquireState::Waiting(waiter)
+                        if let Some(waiter) = self.pool.inner.try_wait(self.start) {
+                            AcquireState::Waiting(waiter)
+                        } else {
+                            return Poll::Ready(Err(AcquireError::PoolBusy));
+                        }
                     } else {
                         // Evaluate any attached future if necessary
                         AcquireState::Resolve(resolve)

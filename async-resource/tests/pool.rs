@@ -3,9 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+//use suspend::block_on;
 use futures_executor::block_on;
 
-use async_resource::PoolConfig;
+use async_resource::{AcquireError, PoolConfig};
 
 mod utils;
 use utils::AtomicCounter;
@@ -168,4 +169,65 @@ fn test_pool_waiter() {
     let mut res = results.lock().unwrap();
     assert!(*res.pop().unwrap() == 1);
     assert!(res.is_empty());
+}
+
+#[test]
+// test support for max_waiters setting
+fn test_pool_max_waiters() {
+    let busy = Arc::new(AtomicCounter::default());
+    let done = Arc::new(AtomicCounter::default());
+    let wait = Arc::new(AtomicCounter::default());
+    let results = Arc::new(Mutex::new(vec![]));
+    let pool = counter_pool_config()
+        .max_count(1)
+        .max_waiters(1)
+        .build()
+        .unwrap();
+    let p1 = pool.clone();
+
+    // load first resource
+    results
+        .lock()
+        .unwrap()
+        .push(block_on(async move { p1.acquire().await.unwrap() }));
+
+    // create waiters for the resource
+    for _ in 0..3 {
+        let pool = pool.clone();
+        let busy = busy.clone();
+        let done = done.clone();
+        let wait = wait.clone();
+        let results = results.clone();
+        thread::spawn(|| {
+            block_on(async move {
+                let acquire = pool.acquire();
+                wait.increment();
+                let result = match acquire.await {
+                    Ok(result) => Ok(result),
+                    Err(AcquireError::PoolBusy) => {
+                        busy.increment();
+                        done.increment();
+                        return;
+                    }
+                    Err(other) => Err(other),
+                };
+                // intentionally poison mutex on failure (acquire timeout, resource error)
+                done.increment();
+                results.lock().unwrap().push(result.unwrap());
+            })
+        });
+    }
+
+    // spin until waiters are queued up
+    loop {
+        if wait.value() == 3 && done.value() >= 2 {
+            break;
+        }
+        thread::yield_now();
+    }
+
+    assert_eq!(busy.value(), 2);
+    assert_eq!(done.value(), 2);
+
+    results.lock().unwrap().is_empty(); // check mutex
 }
