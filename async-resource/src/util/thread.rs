@@ -7,7 +7,7 @@ use std::thread;
 
 use oneshot::{channel, Receiver};
 use option_lock::OptionLock;
-use suspend::{self, Notifier, Suspend};
+use suspend::{sender_task, Notifier, Suspend};
 
 use super::sentinel::Sentinel;
 
@@ -109,7 +109,7 @@ impl<T> ThreadResource<T> {
         F: FnOnce(&mut T) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (sender, task) = suspend::Task::oneshot();
+        let (sender, task) = sender_task();
         self.run_command(Command::Run(Box::new(|res| {
             sender.send(f(res)).unwrap_or(())
         })));
