@@ -53,11 +53,13 @@
 //! let mut listener = susp.listen();
 //! // send a notification (satisfies the current listener)
 //! notifier.notify();
+//! // wait for notification (already sent) with a timeout
 //! assert_eq!(listener.wait_timeout(Duration::from_secs(1)), true);
 //! drop(listener);
 //!
 //! let mut listener = susp.listen();
 //! notifier.notify();
+//! // the listener is also a Future
 //! block_on(async { listener.await });
 //! ```
 
@@ -78,7 +80,8 @@ use futures_core::{
     future::BoxFuture,
     stream::{BoxStream, Stream},
 };
-use futures_task::{waker, ArcWake};
+use futures_task::{waker, waker_ref, ArcWake, WakerRef};
+use pin_utils::pin_mut;
 
 #[cfg(feature = "oneshot")]
 pub use oneshot_rs as oneshot;
@@ -464,9 +467,61 @@ impl Suspend {
         self.inner.acquire()
     }
 
-    /// Construct a new `Waker` associated with the `Suspend` instance.
-    pub fn waker(&self) -> Waker {
-        waker(self.inner.clone())
+    /// Block on the result of a `Future`. When evaluating multiple `Future`s,
+    /// it is more efficient to create one `Suspend` and use this method than
+    /// to create a separate `Task` for each one.
+    pub fn wait_on<F>(&mut self, fut: F) -> F::Output
+    where
+        F: Future,
+    {
+        pin_mut!(fut);
+        let waker = self.waker_ref();
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            let mut listen = self.try_listen().unwrap();
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => break result,
+                Poll::Pending => listen.wait(),
+            }
+        }
+    }
+
+    /// A convenience method to block on the result of a `Future` with a
+    /// deadline. If the deadline is reached before it is resolved, the
+    /// original `Future` is returned as the error value.
+    pub fn wait_on_deadline<F>(&mut self, mut fut: F, expire: Instant) -> Result<F::Output, F>
+    where
+        F: Future + Unpin,
+    {
+        let waker = self.waker_ref();
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            let mut listen = self.try_listen().unwrap();
+            match Pin::new(&mut fut).poll(&mut cx) {
+                Poll::Ready(result) => break Ok(result),
+                Poll::Pending => {
+                    if !listen.wait_deadline(expire) {
+                        break Err(fut);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A convenience method to block on the result of a `Future` with a
+    /// timeout. If the timeout occurs before it is resolved, the original
+    /// `Future` is returned as the error value.
+    pub fn wait_on_timeout<F>(&mut self, fut: F, timeout: Duration) -> Result<F::Output, F>
+    where
+        F: Future + Unpin,
+    {
+        self.wait_on_deadline(fut, Instant::now() + timeout)
+    }
+
+    /// Get a `WakerRef` associated with the `Suspend` instance.
+    /// The resulting instance can be cloned to obtain an owned `Waker`.
+    pub fn waker_ref(&self) -> WakerRef {
+        waker_ref(&self.inner)
     }
 }
 
@@ -479,6 +534,12 @@ impl Debug for Suspend {
             _ => "<!>",
         };
         write!(f, "Suspend({})", state)
+    }
+}
+
+impl Default for Suspend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -562,12 +623,20 @@ enum TaskState<'t, T> {
     Poll(PollFn<'t, T>),
 }
 
-impl<T> TaskState<'_, T> {
-    fn poll(&mut self, cx: &mut Context) -> Poll<T> {
+impl<'t, T> TaskState<'t, T> {
+    fn poll_state(&mut self, cx: &mut Context) -> Poll<T> {
         match self {
             Self::Future(fut) => fut.as_mut().poll(cx),
             Self::Poll(poll) => poll(cx),
         }
+    }
+}
+
+impl<T> Future for TaskState<'_, T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<T> {
+        self.poll_state(cx)
     }
 }
 
@@ -623,56 +692,29 @@ impl<'t, T> Task<'t, T> {
         't: 'm,
     {
         let mut state = self.state;
-        Task::from_poll(move |cx| state.poll(cx).map(&f))
+        Task::from_poll(move |cx| state.poll_state(cx).map(&f))
     }
 
     /// Resolve the `Task` to its result, parking the current thread until
     /// the result is available.
     pub fn wait(self) -> T {
-        if let Ok(result) = self.wait_while(|listen| {
-            listen.wait();
-            true
-        }) {
-            result
-        } else {
-            // should not be possible
-            panic!("wait_while returned error");
-        }
+        Suspend::new().wait_on(self.state)
     }
 
     /// Resolve the `Task` to its result, parking the current thread until
     /// the result is available or the deadline is reached. If a timeout occurs
     /// then the `Err` result will contain the original `Task`.
     pub fn wait_deadline(self, expire: Instant) -> Result<T, Self> {
-        self.wait_while(|listen| listen.wait_deadline(expire))
+        Suspend::new()
+            .wait_on_deadline(self.state, expire)
+            .map_err(|state| Task { state })
     }
 
     /// Resolve the `Task` to its result, parking the current thread until
     /// the result is available or the timeout expires. If a timeout does
     /// occur then the `Err` result will contain the original `Task`.
     pub fn wait_timeout(self, timeout: Duration) -> Result<T, Self> {
-        let expire = Instant::now() + timeout;
-        self.wait_while(|listen| listen.wait_deadline(expire))
-    }
-
-    fn wait_while<F>(mut self, test: F) -> Result<T, Self>
-    where
-        F: Fn(&mut Listener) -> bool,
-    {
-        let mut sus = Suspend::new();
-        let waker = sus.waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut listen = sus.listen();
-        loop {
-            match self.state.poll(&mut cx) {
-                Poll::Ready(result) => break Ok(result),
-                Poll::Pending => {
-                    if !test(&mut listen) {
-                        break Err(self);
-                    }
-                }
-            }
-        }
+        self.wait_deadline(Instant::now() + timeout)
     }
 }
 
@@ -736,7 +778,7 @@ impl<'t, T> Future for Task<'t, T> {
     type Output = T;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.state.poll(cx)
+        self.state.poll_state(cx)
     }
 }
 
@@ -822,49 +864,29 @@ impl<'s, T> Iter<'s, T> {
     /// Resolve the next item in the `Iter` stream, parking the current thread
     /// until the result is available.
     pub fn wait_next(&mut self) -> Option<T> {
-        self.wait_while(|listen| {
-            listen.wait();
-            true
-        })
-        .unwrap()
+        let mut sus = self.suspend.take().unwrap_or_default();
+        let result = sus.wait_on(self.next());
+        self.suspend.replace(sus);
+        result
     }
 
     /// Resolve the next item in the `Iter` stream, parking the current thread
     /// until the result is available or the deadline is reached. If a timeout
     /// occurs then `Err(TimeoutError)` is returned.
     pub fn wait_next_deadline(&mut self, expire: Instant) -> Result<Option<T>, TimeoutError> {
-        self.wait_while(|listen| listen.wait_deadline(expire))
+        let mut sus = self.suspend.take().unwrap_or_default();
+        let result = sus
+            .wait_on_deadline(self.next(), expire)
+            .map_err(|_| TimeoutError);
+        self.suspend.replace(sus);
+        result
     }
 
     /// Resolve the next item in the `Iter` stream, parking the current thread
     /// until the result is available or the timeout expires. If a timeout does
     /// occur then `Err(TimeoutError)` is returned.
     pub fn wait_next_timeout(&mut self, timeout: Duration) -> Result<Option<T>, TimeoutError> {
-        let expire = Instant::now() + timeout;
-        self.wait_while(|listen| listen.wait_deadline(expire))
-    }
-
-    fn wait_while<F>(&mut self, test: F) -> Result<Option<T>, TimeoutError>
-    where
-        F: Fn(&mut Listener) -> bool,
-    {
-        if self.suspend.is_none() {
-            self.suspend.replace(Suspend::new());
-        }
-        let sus = self.suspend.as_mut().unwrap();
-        let waker = sus.waker();
-        let mut listener = sus.listen();
-        let mut cx = Context::from_waker(&waker);
-        loop {
-            match self.state.poll_next(&mut cx) {
-                Poll::Ready(ret) => break Ok(ret),
-                Poll::Pending => {
-                    if !test(&mut listener) {
-                        break Err(TimeoutError);
-                    }
-                }
-            }
-        }
+        self.wait_next_deadline(Instant::now() + timeout)
     }
 }
 
