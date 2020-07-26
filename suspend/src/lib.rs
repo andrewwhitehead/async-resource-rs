@@ -18,24 +18,20 @@
 //! # Examples
 //!
 //! The [`Task`] structure allows a `Future` or a polling function to be
-//! evaluated in a blocking manner:
+//! evaluated in a blocking manner, as well as transform the result to produce
+//! a new Task:
 //!
 //! ```
-//! use suspend::Task;
-//! use std::time::Duration;
-//!
-//! let task = Task::from_fut(async { 100 }).map(|val| val * 2);
-//! assert_eq!(task.wait_timeout(Duration::from_secs(1)), Ok(200));
+//! let task = suspend::Task::from_fut(async { 100 }).map(|val| val * 2);
+//! assert_eq!(task.wait(), 200);
 //! ```
 //!
 //! Similarly, the [`Iter`] structure allows a `Stream` instance to be consumed
 //! in an async or blocking manner:
 //!
 //! ```
-//! use suspend::{Iter, block_on};
-//!
-//! let mut values = Iter::from_iter(1..);
-//! assert_eq!(block_on(async { values.next().await }), Some(1));
+//! let mut values = suspend::Iter::from_iter(1..);
+//! assert_eq!(suspend::block_on(async { values.next().await }), Some(1));
 //! assert_eq!(values.take(3).collect::<Vec<_>>(), vec![2, 3, 4]);
 //! ```
 //!
@@ -44,9 +40,8 @@
 //!
 //! ```
 //! use std::time::Duration;
-//! use suspend::{Suspend, block_on};
 //!
-//! let mut susp = Suspend::new();
+//! let mut susp = suspend::Suspend::new();
 //! let notifier = susp.notifier();
 //!
 //! // start listening for notifications
@@ -60,7 +55,16 @@
 //! let mut listener = susp.listen();
 //! notifier.notify();
 //! // the listener is also a Future
-//! block_on(async { listener.await });
+//! suspend::block_on(async { listener.await });
+//! ```
+//!
+//!
+//! It can also be used to directly poll a `Future`:
+//!
+//! ```
+//! let mut susp = suspend::Suspend::new();
+//! let mut task = suspend::Task::from_fut(async { 99 });
+//! assert_eq!(susp.poll_unpin(&mut task), Ok(99));
 //! ```
 
 use std::cell::UnsafeCell;
@@ -100,13 +104,13 @@ where
 /// [`TaskSender<T>`](TaskSender) and a
 /// [`Task<Result<T, Incomplete>`](Task). Once [`TaskSender::send`] is called
 /// or the `TaskSender` is dropped, the `Task` will be resolved.
-pub fn channel<'t, T: 't>() -> (TaskSender<T>, Task<'t, Result<T, Incomplete>>) {
+pub fn channel<'t, T: Send + 'static>() -> (TaskSender<T>, Task<'t, Result<T, Incomplete>>) {
     let channel = Arc::new(Channel::new());
     (
         TaskSender {
             channel: channel.clone(),
         },
-        Task::from(TaskReceiver { channel }),
+        Task::from_custom(TaskReceiver { channel }),
     )
 }
 
@@ -119,14 +123,14 @@ where
     Iter::from_stream(stream)
 }
 
-/// Create a new single-use `Notifier` and a corresponding `Task`. Once
-/// notified, the `Task` will resolve to `()`.
+/// Create a new single-use [`Notifier`] and a corresponding [`Task`]. Once
+/// notified, the Task will resolve to `()`.
 pub fn notify_once<'a>() -> (Notifier, Task<'a, ()>) {
     let inner = Arc::new(InnerSuspend::new(WAIT));
     let notifier = Notifier {
         inner: inner.clone(),
     };
-    (notifier, Task::from_poll(move |cx| inner.poll(cx.waker())))
+    (notifier, Task::from_poll(move |cx| inner.poll(cx)))
 }
 
 /// A convenience method to create a new `Task` from a result value.
@@ -152,7 +156,7 @@ impl InnerNotify {
     }
 }
 
-/// An error indicating that the `TaskSender` side of a one-shot channel was
+/// An error indicating that the [`TaskSender`] side of a one-shot channel was
 /// dropped without sending a result.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Incomplete;
@@ -165,8 +169,8 @@ impl Display for Incomplete {
 
 impl std::error::Error for Incomplete {}
 
-/// A timeout error which may be returned when waiting for a `Suspend` or
-/// `Iter` with a given expiry time.
+/// A timeout error which may be returned when waiting for a [`Listener`],
+/// [`Task`] or [`Iter`] with a given expiry time.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TimedOut;
 
@@ -298,7 +302,7 @@ impl InnerSuspend {
         }
     }
 
-    pub fn poll(&self, waker: &Waker) -> Poll<()> {
+    pub fn poll(&self, cx: &mut Context) -> Poll<()> {
         match self.state() {
             IDLE => {
                 return Poll::Ready(());
@@ -313,7 +317,7 @@ impl InnerSuspend {
             _ => (),
         }
 
-        if self.listen(InnerNotify::Waker(waker.clone())) {
+        if self.listen(InnerNotify::Waker(cx.waker().clone())) {
             Poll::Pending
         } else {
             // already notified
@@ -417,6 +421,27 @@ impl Suspend {
         self.try_listen().expect("Invalid Suspend state")
     }
 
+    /// Poll a `Future`, returning the result if ready, otherwise a `Listener`
+    /// instance which will be notified when the future should be polled again.
+    pub fn poll<F>(&mut self, fut: Pin<&mut F>) -> Result<F::Output, Listener<'_>>
+    where
+        F: Future,
+    {
+        let mut listener = self.listen();
+        match listener.poll(fut) {
+            Poll::Ready(r) => Ok(r),
+            Poll::Pending => Err(listener),
+        }
+    }
+
+    /// A convenience method to poll a `Future + Unpin`.
+    pub fn poll_unpin<F>(&mut self, fut: &mut F) -> Result<F::Output, Listener<'_>>
+    where
+        F: Future + Unpin,
+    {
+        self.poll(Pin::new(fut))
+    }
+
     /// Try to construct a `Listener` and start listening for notifications
     /// when only a read-only reference to the `Suspend` is available.
     pub fn try_listen(&self) -> Option<Listener<'_>> {
@@ -435,13 +460,10 @@ impl Suspend {
         F: Future,
     {
         pin_mut!(fut);
-        let waker = self.waker_ref();
-        let mut cx = Context::from_waker(&waker);
         loop {
-            let mut listen = self.try_listen().unwrap();
-            match fut.as_mut().poll(&mut cx) {
-                Poll::Ready(result) => break result,
-                Poll::Pending => listen.wait(),
+            match self.poll(fut.as_mut()) {
+                Ok(result) => break result,
+                Err(mut listen) => listen.wait(),
             }
         }
     }
@@ -453,13 +475,10 @@ impl Suspend {
     where
         F: Future + Unpin,
     {
-        let waker = self.waker_ref();
-        let mut cx = Context::from_waker(&waker);
         loop {
-            let mut listen = self.try_listen().unwrap();
-            match Pin::new(&mut fut).poll(&mut cx) {
-                Poll::Ready(result) => break Ok(result),
-                Poll::Pending => {
+            match self.poll_unpin(&mut fut) {
+                Ok(result) => break Ok(result),
+                Err(mut listen) => {
                     if !listen.wait_deadline(expire) {
                         break Err(fut);
                     }
@@ -503,7 +522,7 @@ impl Default for Suspend {
     }
 }
 
-/// The result of acquiring a `Suspend` using either [`Suspend::listen`] or
+/// The result of acquiring a [`Suspend`] using either [`Suspend::listen`] or
 /// [`Suspend::try_listen`]. It may be used to wait for a notification with
 /// `.await` or by parking the current thread.
 pub struct Listener<'a> {
@@ -514,6 +533,24 @@ impl Listener<'_> {
     /// Check if the listener has already been notified.
     pub fn is_notified(&self) -> bool {
         self.inner.state() == IDLE
+    }
+
+    /// Poll a `Future`, which will then notify this listener when ready.
+    pub fn poll<F>(&mut self, fut: Pin<&mut F>) -> Poll<F::Output>
+    where
+        F: Future,
+    {
+        let waker = waker_ref(self.inner);
+        let mut cx = Context::from_waker(&*waker);
+        fut.poll(&mut cx)
+    }
+
+    /// A convenience method to poll a `Future + Unpin`.
+    pub fn poll_unpin<F>(&mut self, fut: &mut F) -> Poll<F::Output>
+    where
+        F: Future + Unpin,
+    {
+        self.poll(Pin::new(fut))
     }
 
     /// Wait for a notification on the associated `Suspend` instance, parking
@@ -537,6 +574,24 @@ impl Listener<'_> {
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
         self.inner.wait_timeout(timeout)
     }
+
+    /// Get a `WakerRef` associated with the `Listener`.
+    /// The resulting instance can be cloned to obtain an owned `Waker`.
+    pub fn waker_ref(&self) -> WakerRef {
+        waker_ref(self.inner)
+    }
+}
+
+impl Debug for Listener<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let state = match self.inner.state() {
+            IDLE => "Notified",
+            WAIT => "Waiting",
+            LISTEN => "Polled",
+            _ => "<!>",
+        };
+        write!(f, "Listener({})", state)
+    }
 }
 
 impl Drop for Listener<'_> {
@@ -545,13 +600,21 @@ impl Drop for Listener<'_> {
     }
 }
 
-impl<'a> Future for Listener<'a> {
+impl Future for Listener<'_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner.poll(cx.waker())
+        self.inner.poll(cx)
     }
 }
+
+impl PartialEq for Listener<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for Listener<'_> {}
 
 /// An instance of a notifier for a `Suspend` instance. When notified, the
 /// associated thread or `Future` will be woken if currently suspended.
@@ -583,8 +646,50 @@ impl Clone for Notifier {
 /// A polling function equivalent to `Future::poll`.
 pub type PollFn<'a, T> = Box<dyn FnMut(&mut Context) -> Poll<T> + Send + 'a>;
 
+pub trait CustomTask<T> {
+    fn cancel(&mut self) {}
+
+    fn is_terminated(&self) -> bool {
+        false
+    }
+
+    fn poll(&mut self, cx: &mut Context) -> Poll<T>;
+
+    fn wait(&mut self) -> T {
+        let mut suspend = Suspend::new();
+        loop {
+            let mut listen = suspend.listen();
+            let waker = listen.waker_ref();
+            let mut cx = Context::from_waker(&*waker);
+            match self.poll(&mut cx) {
+                Poll::Pending => listen.wait(),
+                Poll::Ready(result) => return result,
+            }
+        }
+    }
+
+    fn wait_deadline(&mut self, expire: Instant) -> Result<T, TimedOut> {
+        let mut suspend = Suspend::new();
+        loop {
+            let mut listen = suspend.listen();
+            let waker = listen.waker_ref();
+            let mut cx = Context::from_waker(&*waker);
+            match self.poll(&mut cx) {
+                Poll::Pending => {
+                    if !listen.wait_deadline(expire) {
+                        return Err(TimedOut);
+                    }
+                }
+                Poll::Ready(result) => return Ok(result),
+            }
+        }
+    }
+}
+
+pub type BoxedCustomTask<'t, T> = Box<dyn CustomTask<T> + Send + 't>;
+
 enum TaskState<'t, T> {
-    Channel(TaskReceiver<T>),
+    Custom(BoxedCustomTask<'t, T>),
     Future(BoxFuture<'t, T>),
     Poll(PollFn<'t, T>),
     Done,
@@ -593,7 +698,7 @@ enum TaskState<'t, T> {
 impl<'t, T> TaskState<'t, T> {
     fn cancel(&mut self) {
         match self {
-            Self::Channel(chan) => chan.close(),
+            Self::Custom(inner) => inner.cancel(),
             _ => (),
         }
     }
@@ -604,7 +709,7 @@ impl<'t, T> TaskState<'t, T> {
 
     fn poll_state(&mut self, cx: &mut Context) -> Poll<T> {
         let result = match self {
-            Self::Channel(chan) => chan.poll(cx.waker()),
+            Self::Custom(inner) => inner.poll(cx),
             Self::Future(fut) => fut.as_mut().poll(cx),
             Self::Poll(poll) => poll(cx),
             Self::Done => return Poll::Pending,
@@ -617,14 +722,14 @@ impl<'t, T> TaskState<'t, T> {
 
     pub fn wait(self) -> T {
         match self {
-            Self::Channel(mut chan) => chan.wait(),
+            Self::Custom(mut inner) => inner.wait(),
             _ => Suspend::new().wait_on(self),
         }
     }
 
     pub fn wait_deadline(mut self, expire: Instant) -> Result<T, Self> {
         match &mut self {
-            TaskState::Channel(chan) => chan.wait_deadline(expire).map_err(|_| self),
+            TaskState::Custom(inner) => inner.wait_deadline(expire).map_err(|_| self),
             _ => Suspend::new().wait_on_deadline(self, expire),
         }
     }
@@ -646,6 +751,15 @@ pub struct Task<'t, T> {
 }
 
 impl<'t, T> Task<'t, T> {
+    /// Create a new `Task` from a `CustomTask<T>`. If the custom task is
+    /// already boxed, then it would be more efficient to use `Task::from`.
+    pub fn from_custom<C>(task: C) -> Self
+    where
+        C: CustomTask<T> + Send + 't,
+    {
+        Self::from(Box::new(task) as BoxedCustomTask<'t, T>)
+    }
+
     /// Create a new `Task` from a function returning `Poll<T>`. If the
     /// function is already boxed, then it would be more efficient to use
     /// `Task::from`.
@@ -662,9 +776,7 @@ impl<'t, T> Task<'t, T> {
     where
         F: Future<Output = T> + Send + 't,
     {
-        Self {
-            state: TaskState::Future(Box::pin(f) as BoxFuture<'t, T>),
-        }
+        Self::from(Box::pin(f) as BoxFuture<'t, T>)
     }
 
     /// Create a new `Task` from a result value.
@@ -793,10 +905,10 @@ impl<'t, T> FusedFuture for Task<'t, T> {
     }
 }
 
-impl<'t, T> From<TaskReceiver<T>> for Task<'t, T> {
-    fn from(receiver: TaskReceiver<T>) -> Self {
+impl<'t, T> From<BoxedCustomTask<'t, T>> for Task<'t, T> {
+    fn from(inner: BoxedCustomTask<'t, T>) -> Self {
         Task {
-            state: TaskState::Channel(receiver),
+            state: TaskState::Custom(inner),
         }
     }
 }
@@ -1013,8 +1125,8 @@ impl<T> Channel<T> {
         }
     }
 
-    pub fn poll(&self, waker: &Waker) -> Poll<T> {
-        self.state.poll(waker).map(|_| unsafe { self.take(true) })
+    pub fn poll(&self, cx: &mut Context) -> Poll<T> {
+        self.state.poll(cx).map(|_| unsafe { self.take(true) })
     }
 
     pub fn send(&self, value: T) -> Result<(), T> {
@@ -1056,7 +1168,7 @@ impl<T> Channel<T> {
 }
 
 /// Created by [`channel`] and used to dispatch a single message to a
-/// receiving `Task`.
+/// receiving [`Task`].
 pub struct TaskSender<T> {
     channel: Arc<Channel<Result<T, Incomplete>>>,
 }
@@ -1080,20 +1192,20 @@ struct TaskReceiver<T> {
     channel: Arc<Channel<T>>,
 }
 
-impl<T> TaskReceiver<T> {
-    pub fn close(&mut self) {
+impl<T: Send> CustomTask<T> for TaskReceiver<T> {
+    fn cancel(&mut self) {
         self.channel.close_recv();
     }
 
-    pub fn poll(&mut self, waker: &Waker) -> Poll<T> {
-        self.channel.poll(waker)
+    fn poll(&mut self, cx: &mut Context) -> Poll<T> {
+        self.channel.poll(cx)
     }
 
-    pub fn wait(&mut self) -> T {
+    fn wait(&mut self) -> T {
         self.channel.wait()
     }
 
-    pub fn wait_deadline(&mut self, expire: Instant) -> Result<T, TimedOut> {
+    fn wait_deadline(&mut self, expire: Instant) -> Result<T, TimedOut> {
         self.channel.wait_deadline(expire)
     }
 }

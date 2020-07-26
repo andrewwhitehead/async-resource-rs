@@ -28,5 +28,9 @@ oneshot_rs = { package = "oneshot", version = "0.1" }
 name = "suspend"
 
 [[bench]]
-name = "telephone"
+name = "channels_many"
+harness = false
+
+[[bench]]
+name = "channels_telephone"
 harness = false
