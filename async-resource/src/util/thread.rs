@@ -5,9 +5,8 @@ use std::sync::{
 };
 use std::thread;
 
-use oneshot::{channel, Receiver};
 use option_lock::OptionLock;
-use suspend::{sender_task, Notifier, Suspend};
+use suspend::{channel, Notifier, Suspend};
 
 use super::sentinel::Sentinel;
 
@@ -17,7 +16,7 @@ pub enum Command<T> {
     Stop,
 }
 
-pub type Canceled = oneshot::RecvError;
+pub type Canceled = suspend::Incomplete;
 
 pub type Task<'t, R> = suspend::Task<'t, Result<R, Canceled>>;
 
@@ -69,9 +68,9 @@ impl<T> ThreadResource<T> {
                 Ok(res) => (Some(res), Ok(())),
                 Err(err) => (None, Err(err)),
             };
-            send_start
-                .send(start)
-                .expect("ThreadResource::try_create() receiver dropped");
+            if send_start.send(start).is_err() {
+                panic!("ThreadResource::try_create() receiver dropped");
+            }
             let mut res = match res {
                 Some(res) => res,
                 None => return,
@@ -95,7 +94,7 @@ impl<T> ThreadResource<T> {
                 }
             }
         }));
-        recv_start.recv().unwrap()?;
+        recv_start.wait().unwrap()?;
         Ok(Self {
             handle,
             notifier,
@@ -109,7 +108,7 @@ impl<T> ThreadResource<T> {
         F: FnOnce(&mut T) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (sender, task) = sender_task();
+        let (sender, task) = channel();
         self.run_command(Command::Run(Box::new(|res| {
             sender.send(f(res)).unwrap_or(())
         })));
@@ -117,15 +116,15 @@ impl<T> ThreadResource<T> {
     }
 
     #[must_use]
-    pub fn extract(mut self) -> Receiver<T>
+    pub fn extract<'a>(mut self) -> Task<'a, T>
     where
         T: Send + 'static,
     {
         let (sender, receiver) = channel();
         self.run_command(Command::Extract(Box::new(|res| {
-            sender
-                .send(res)
-                .expect("ThreadResource::extract() receiver dropped");
+            if sender.send(res).is_err() {
+                panic!("ThreadResource::extract() receiver dropped");
+            }
         })));
         // skip Stop procedure
         self.handle.take();
@@ -177,6 +176,6 @@ mod tests {
     fn thread_resource_basic() {
         let mut res = ThreadResource::create(|| 100u32);
         res.enter(|i| *i += 1).wait().unwrap();
-        assert_eq!(res.extract().recv(), Ok(101));
+        assert_eq!(res.extract().wait(), Ok(101));
     }
 }

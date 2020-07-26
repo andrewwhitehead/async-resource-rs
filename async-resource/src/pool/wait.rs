@@ -2,13 +2,12 @@ use std::fmt::{self, Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use oneshot;
 use option_lock::OptionLock;
 
-pub use self::oneshot::RecvError as Canceled;
+pub use suspend::Incomplete as Canceled;
 
-pub fn waiter_pair<T>() -> (WaitResponder<T>, Waiter<T>) {
-    let (sender, receiver) = oneshot::channel();
+pub fn waiter_pair<T: 'static>() -> (WaitResponder<T>, Waiter<T>) {
+    let (sender, receiver) = suspend::channel();
     (
         WaitResponder {
             sender: Arc::new(OptionLock::from(sender)),
@@ -18,7 +17,7 @@ pub fn waiter_pair<T>() -> (WaitResponder<T>, Waiter<T>) {
 }
 
 pub struct WaitResponder<T> {
-    sender: Arc<OptionLock<oneshot::Sender<T>>>,
+    sender: Arc<OptionLock<suspend::TaskSender<T>>>,
 }
 
 impl<T> WaitResponder<T> {
@@ -34,7 +33,7 @@ impl<T> WaitResponder<T> {
 
     pub fn send(self, resolve: T) -> Result<(), T> {
         if let Ok(sender) = self.sender.try_take() {
-            sender.send(resolve).map_err(|e| e.into_inner())
+            sender.send(resolve)
         } else {
             Err(resolve)
         }
@@ -58,7 +57,7 @@ impl<T> Debug for WaitResponder<T> {
 }
 
 pub struct Waiter<T> {
-    receiver: oneshot::Receiver<T>,
+    receiver: suspend::Task<'static, Result<T, Canceled>>,
 }
 
 impl<T> Debug for Waiter<T> {
@@ -68,7 +67,7 @@ impl<T> Debug for Waiter<T> {
 }
 
 impl<T> Deref for Waiter<T> {
-    type Target = oneshot::Receiver<T>;
+    type Target = suspend::Task<'static, Result<T, Canceled>>;
     fn deref(&self) -> &Self::Target {
         &self.receiver
     }
