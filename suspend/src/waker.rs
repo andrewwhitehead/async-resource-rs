@@ -1,5 +1,4 @@
 use std::marker::PhantomData;
-use std::mem;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::task::{RawWaker, RawWakerVTable, Waker};
@@ -41,9 +40,8 @@ fn raw_waker<W: CloneWake>(inst: Box<W>) -> RawWaker {
 }
 
 unsafe fn clone_waker_raw<W: CloneWake>(data: *const ()) -> RawWaker {
-    let inst = Box::from_raw(data as *mut W);
-    let result = raw_waker(inst.clone());
-    mem::forget(inst);
+    let inst = &*(data as *const W);
+    let result = raw_waker(Box::new(inst.clone()));
     result
 }
 
@@ -53,9 +51,8 @@ unsafe fn wake_waker_raw<W: CloneWake>(data: *const ()) {
 }
 
 unsafe fn wake_by_ref_waker_raw<W: CloneWake>(data: *const ()) {
-    let inst = Box::from_raw(data as *mut W);
+    let inst = &*(data as *const W);
     inst.wake();
-    mem::forget(inst);
 }
 
 unsafe fn drop_waker_raw<W: CloneWake>(data: *const ()) {
@@ -89,26 +86,16 @@ fn raw_local_waker<W: CloneWake>(mut inst: Pin<&mut W>) -> RawWaker {
     RawWaker::new(
         data,
         &RawWakerVTable::new(
-            clone_local_waker_raw::<W>,
-            wake_by_local_waker_raw::<W>,
-            wake_by_ref_local_waker_raw::<W>,
+            clone_waker_raw::<W>,
+            wake_local_waker_raw::<W>,
+            wake_by_ref_waker_raw::<W>,
             noop_drop,
         ),
     )
 }
 
-unsafe fn clone_local_waker_raw<W: CloneWake>(data: *const ()) -> RawWaker {
-    let inst = &*(data as *const W);
-    raw_waker(Box::new(inst.clone()))
-}
-
-unsafe fn wake_by_local_waker_raw<W: CloneWake>(_data: *const ()) {
+unsafe fn wake_local_waker_raw<W: CloneWake>(_data: *const ()) {
     unimplemented!();
-}
-
-unsafe fn wake_by_ref_local_waker_raw<W: CloneWake>(data: *const ()) {
-    let inst = &*(data as *const W);
-    inst.wake();
 }
 
 unsafe fn noop_drop(_data: *const ()) {}
@@ -123,6 +110,6 @@ macro_rules! local_waker {
         #[allow(unused_mut)]
         let mut $x = unsafe { std::pin::Pin::new_unchecked(&mut $x) };
 
-        let $x = LocalWaker::new($x);
+        let $x = $crate::LocalWaker::new($x);
     };
 }

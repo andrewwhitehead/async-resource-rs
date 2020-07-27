@@ -58,7 +58,6 @@
 //! suspend::block_on(async { listener.await });
 //! ```
 //!
-//!
 //! It can also be used to directly poll a `Future`:
 //!
 //! ```
@@ -89,14 +88,15 @@ use pin_utils::pin_mut;
 
 #[macro_use]
 mod waker;
-pub use waker::{current_thread_waker, thread_waker};
+pub use waker::{current_thread_waker, thread_waker, LocalWaker};
 
 #[cfg(feature = "test_clone_waker")]
-pub use waker::{waker_from, CloneWake, LocalWaker};
+pub use waker::{waker_from, CloneWake};
 
 const IDLE: u8 = 0x0;
 const WAIT: u8 = 0x1;
 const LISTEN: u8 = 0x2;
+const CLOSED: u8 = 0x3;
 
 /// A convenience method to evaluate a `Future`, blocking the current thread
 /// until it is resolved.
@@ -248,6 +248,17 @@ impl InnerSuspend {
         }
     }
 
+    // pub fn close(&self) -> bool {
+    //     match self.clear(CLOSED) {
+    //         ClearResult::Removed(waker) => {
+    //             waker.wake();
+    //             true
+    //         }
+    //         ClearResult::Updated => true,
+    //         ClearResult::NoChange => false,
+    //     }
+    // }
+
     pub fn is_waiting(&self) -> bool {
         let s = self.state();
         s == WAIT || s == LISTEN
@@ -256,7 +267,7 @@ impl InnerSuspend {
     /// Try to start listening with a new waker
     pub fn listen(&self, waker: &Waker) -> bool {
         match self.state() {
-            IDLE => {
+            IDLE | CLOSED => {
                 // not currently acquired
                 return false;
             }
@@ -283,7 +294,7 @@ impl InnerSuspend {
                         Err(LISTEN) => {
                             // retry
                         }
-                        Err(IDLE) => {
+                        Err(IDLE) | Err(CLOSED) => {
                             // already notified
                             return false;
                         }
@@ -305,6 +316,7 @@ impl InnerSuspend {
                 }
                 false
             }
+            CLOSED => false,
             _ => panic!("Invalid state"),
         }
     }
@@ -324,7 +336,7 @@ impl InnerSuspend {
 
     pub fn poll(&self, cx: &mut Context) -> Poll<()> {
         match self.state() {
-            IDLE => {
+            IDLE | CLOSED => {
                 return Poll::Ready(());
             }
             LISTEN => {
@@ -365,7 +377,8 @@ impl InnerSuspend {
         }
         loop {
             thread::park();
-            if self.state() == IDLE {
+            let s = self.state();
+            if s == IDLE || s == CLOSED {
                 break;
             }
         }
@@ -379,7 +392,8 @@ impl InnerSuspend {
         }
         while let Some(dur) = expire.checked_duration_since(Instant::now()) {
             thread::park_timeout(dur);
-            if self.state() == IDLE {
+            let s = self.state();
+            if s == IDLE || s == CLOSED {
                 // notified
                 return true;
             }
@@ -389,7 +403,14 @@ impl InnerSuspend {
     }
 
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        self.wait_deadline(Instant::now() + timeout)
+        Instant::now()
+            .checked_add(timeout)
+            .map(|expire| self.wait_deadline(expire))
+            .unwrap_or(false)
+    }
+
+    pub fn waker_ref<'a>(self: &'a Arc<Self>) -> WakerRef<'a> {
+        waker_ref(self)
     }
 }
 
@@ -516,13 +537,16 @@ impl Suspend {
     where
         F: Future + Unpin,
     {
-        self.wait_on_deadline(fut, Instant::now() + timeout)
+        match Instant::now().checked_add(timeout) {
+            Some(expire) => self.wait_on_deadline(fut, expire),
+            None => Err(fut),
+        }
     }
 
     /// Get a `WakerRef` associated with the `Suspend` instance.
     /// The resulting instance can be cloned to obtain an owned `Waker`.
     pub fn waker_ref(&self) -> WakerRef {
-        waker_ref(&self.inner)
+        self.inner.waker_ref()
     }
 }
 
@@ -562,7 +586,7 @@ impl Listener<'_> {
     where
         F: Future,
     {
-        let waker = waker_ref(self.inner);
+        let waker = self.inner.waker_ref();
         let mut cx = Context::from_waker(&*waker);
         fut.poll(&mut cx)
     }
@@ -600,7 +624,7 @@ impl Listener<'_> {
     /// Get a `WakerRef` associated with the `Listener`.
     /// The resulting instance can be cloned to obtain an owned `Waker`.
     pub fn waker_ref(&self) -> WakerRef {
-        waker_ref(self.inner)
+        self.inner.waker_ref()
     }
 }
 
@@ -869,7 +893,10 @@ impl<'t, T> Task<'t, T> {
     /// the result is available or the timeout expires. If a timeout does
     /// occur then the `Err` result will contain the original `Task`.
     pub fn wait_timeout(self, timeout: Duration) -> Result<T, Self> {
-        self.wait_deadline(Instant::now() + timeout)
+        match Instant::now().checked_add(timeout) {
+            Some(expire) => self.wait_deadline(expire),
+            None => Err(self),
+        }
     }
 }
 
@@ -980,7 +1007,6 @@ impl<'s, T> IterState<'s, T> {
 /// operations with an optional timeout.
 #[must_use = "Iter must be awaited"]
 pub struct Iter<'s, T> {
-    suspend: Option<Suspend>,
     state: IterState<'s, T>,
 }
 
@@ -1034,29 +1060,24 @@ impl<'s, T> Iter<'s, T> {
     /// Resolve the next item in the `Iter` stream, parking the current thread
     /// until the result is available.
     pub fn wait_next(&mut self) -> Option<T> {
-        let mut sus = self.suspend.take().unwrap_or_default();
-        let result = sus.wait_on(self.next());
-        self.suspend.replace(sus);
-        result
+        block_on(self.next())
     }
 
     /// Resolve the next item in the `Iter` stream, parking the current thread
     /// until the result is available or the deadline is reached. If a timeout
     /// occurs then `Err(TimedOut)` is returned.
     pub fn wait_next_deadline(&mut self, expire: Instant) -> Result<Option<T>, TimedOut> {
-        let mut sus = self.suspend.take().unwrap_or_default();
-        let result = sus
-            .wait_on_deadline(self.next(), expire)
-            .map_err(|_| TimedOut);
-        self.suspend.replace(sus);
-        result
+        block_on_deadline(self.next(), expire).map_err(|_| TimedOut)
     }
 
     /// Resolve the next item in the `Iter` stream, parking the current thread
     /// until the result is available or the timeout expires. If a timeout does
     /// occur then `Err(TimedOut)` is returned.
     pub fn wait_next_timeout(&mut self, timeout: Duration) -> Result<Option<T>, TimedOut> {
-        self.wait_next_deadline(Instant::now() + timeout)
+        match Instant::now().checked_add(timeout) {
+            Some(expire) => self.wait_next_deadline(expire),
+            None => Err(TimedOut),
+        }
     }
 }
 
@@ -1089,7 +1110,6 @@ impl<'t, T, E> Iter<'t, Result<T, E>> {
 impl<'s, T> From<BoxStream<'s, T>> for Iter<'s, T> {
     fn from(stream: BoxStream<'s, T>) -> Self {
         Self {
-            suspend: None,
             state: IterState::Stream(stream),
         }
     }
@@ -1098,7 +1118,6 @@ impl<'s, T> From<BoxStream<'s, T>> for Iter<'s, T> {
 impl<'s, T> From<PollNextFn<'s, T>> for Iter<'s, T> {
     fn from(poll: PollNextFn<'s, T>) -> Self {
         Self {
-            suspend: None,
             state: IterState::PollNext(poll),
         }
     }
