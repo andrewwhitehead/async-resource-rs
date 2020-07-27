@@ -3,7 +3,10 @@ use std::sync::{
     Arc,
 };
 
-use suspend::{local_waker, waker_from, CloneWake, LocalWaker};
+use suspend::{
+    local_waker,
+    waker::{waker_from, CloneWake, LocalWaker},
+};
 
 use pin_utils::pin_mut;
 
@@ -36,7 +39,7 @@ impl TestWaker {
 }
 
 impl CloneWake for TestWaker {
-    fn wake(&self) {
+    fn wake_by_ref(&self) {
         self.woken.fetch_add(1, Ordering::SeqCst);
     }
 }
