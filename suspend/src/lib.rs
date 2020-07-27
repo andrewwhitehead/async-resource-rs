@@ -99,3 +99,5 @@ pub use self::task::{Task, TaskSender};
 /// Utilities for creating `Waker` instances.
 #[macro_use]
 pub mod waker;
+#[cfg(not(feature = "test_clone_waker"))]
+pub(crate) use local_waker;
