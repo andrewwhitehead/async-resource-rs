@@ -99,7 +99,7 @@ enum TaskState<'t, T> {
     Future(BoxFuture<'t, T>),
     FusedFuture(BoxFusedFuture<'t, T>),
     Poll(PollFn<'t, T>),
-    Done,
+    Terminated,
 }
 
 impl<'t, T> TaskState<'t, T> {
@@ -114,7 +114,7 @@ impl<'t, T> TaskState<'t, T> {
         match self {
             Self::Custom(inner) => inner.is_terminated(),
             Self::FusedFuture(fut) => fut.is_terminated(),
-            Self::Done => true,
+            Self::Terminated => true,
             _ => false,
         }
     }
@@ -125,10 +125,10 @@ impl<'t, T> TaskState<'t, T> {
             Self::Future(fut) => fut.as_mut().poll(cx),
             Self::FusedFuture(fut) => fut.as_mut().poll(cx),
             Self::Poll(poll) => poll(cx),
-            Self::Done => return Poll::Pending,
+            Self::Terminated => return Poll::Pending,
         };
         result.map(|r| {
-            *self = Self::Done;
+            *self = Self::Terminated;
             r
         })
     }
