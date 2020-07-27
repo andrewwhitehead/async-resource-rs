@@ -2,12 +2,12 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use futures_channel::oneshot as futures_oneshot;
 use oneshot_rs as oneshot;
-use suspend::{channel, Suspend};
+use suspend::{message_task, Suspend};
 
 fn channel_many(count: usize) {
     let mut sus = Suspend::new();
     for _ in 0..count {
-        let (sender, mut receiver) = channel();
+        let (sender, mut receiver) = message_task();
         sus.poll_unpin(&mut receiver).unwrap_err();
         drop(receiver);
         sender.send(1).unwrap_err();

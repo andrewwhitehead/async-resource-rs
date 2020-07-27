@@ -667,7 +667,6 @@ dependencies = [
  "futures-task",
  "oneshot",
  "pin-utils",
- "suspend",
 ]
 
 [[package]]

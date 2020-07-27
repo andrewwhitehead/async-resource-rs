@@ -68,10 +68,3 @@ fn iter_stream_basic() {
     let iter = iter_stream(OddStream(1));
     assert_eq!(iter.take(3).collect::<Vec<i32>>(), vec![1, 3, 5]);
 }
-
-#[test]
-fn channel_basic() {
-    let (sender, task) = channel();
-    sender.send(15).unwrap();
-    assert_eq!(task.wait(), Ok(15));
-}

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use super::core::{ClearResult, InnerSuspend};
+use super::core::InnerSuspend;
 use super::error::{Incomplete, TimedOut};
 use super::task::CustomTask;
 
@@ -25,10 +25,11 @@ impl<T> Channel<T> {
     }
 
     pub fn close_recv(&self) -> bool {
-        match self.state.set_idle() {
-            ClearResult::NoChange => false,
-            _ => true,
-        }
+        self.state.close().is_updated()
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        self.state.is_waiting()
     }
 
     pub fn poll(&self, cx: &mut Context) -> Poll<T> {
@@ -51,10 +52,10 @@ impl<T> Channel<T> {
         }
     }
 
-    pub unsafe fn take(&self, reset: bool) -> T {
+    pub unsafe fn take(&self, close: bool) -> T {
         let result = self.data.get().read().assume_init();
-        if reset {
-            self.state.acquire();
+        if close {
+            self.state.close();
         }
         result
     }
@@ -85,13 +86,18 @@ impl<T> Channel<Result<T, Incomplete>> {
     }
 }
 
-/// Created by [`channel`](crate::task::channel) and used to dispatch a single
-/// message to a receiving [`Task`](crate::task::Task).
+/// Created by [`message_task`](crate::task::message_task) and used to dispatch
+/// a single message to a receiving [`Task`](crate::task::Task).
 pub struct TaskSender<T> {
     channel: Arc<Channel<Result<T, Incomplete>>>,
 }
 
 impl<T> TaskSender<T> {
+    /// Check if the receiver has already been dropped.
+    pub fn is_canceled(&self) -> bool {
+        !self.channel.is_waiting()
+    }
+
     /// Dispatch the result and consume the `TaskSender`.
     pub fn send(self, value: T) -> Result<(), T> {
         let result = self.channel.send(Ok(value));

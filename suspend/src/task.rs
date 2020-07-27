@@ -27,7 +27,7 @@ pub type BoxFusedFuture<'t, T> = Pin<Box<dyn FusedFuture<Output = T> + Send + 't
 /// [`TaskSender<T>`](TaskSender) and a
 /// [`Task<Result<T, Incomplete>>`](Task). Once [`TaskSender::send`] is called
 /// or the `TaskSender` is dropped, the `Task` will be resolved.
-pub fn channel<'t, T: Send + 'static>() -> (TaskSender<T>, Task<'t, Result<T, Incomplete>>) {
+pub fn message_task<'t, T: Send + 'static>() -> (TaskSender<T>, Task<'t, Result<T, Incomplete>>) {
     let (sender, receiver) = Channel::pair();
     (sender, Task::from_custom(receiver))
 }
@@ -54,7 +54,7 @@ pub trait CustomTask<T> {
         false
     }
 
-    /// Equivalent to `FusedFuture::is_terminated`, this method should return
+    /// Equivalent to `FusedFuture::is_terminated`, this method must return
     /// `true` if polling should no longer be attempted.
     fn is_terminated(&self) -> bool {
         false
@@ -120,14 +120,14 @@ impl<'t, T> TaskState<'t, T> {
     }
 
     fn poll_state(&mut self, cx: &mut Context) -> Poll<T> {
-        let result = match self {
+        match self {
             Self::Custom(inner) => inner.poll(cx),
             Self::Future(fut) => fut.as_mut().poll(cx),
             Self::FusedFuture(fut) => fut.as_mut().poll(cx),
             Self::Poll(poll) => poll(cx),
             Self::Terminated => return Poll::Pending,
-        };
-        result.map(|r| {
+        }
+        .map(|r| {
             *self = Self::Terminated;
             r
         })

@@ -6,7 +6,7 @@ use std::sync::{
 use std::thread;
 
 use option_lock::OptionLock;
-use suspend::{channel, Notifier, Suspend};
+use suspend::{message_task, Notifier, Suspend};
 
 use super::sentinel::Sentinel;
 
@@ -66,7 +66,7 @@ impl<T> ThreadResource<T> {
         let notifier = suspend.notifier();
         let state = Arc::new(State::new());
         let int_state = state.clone();
-        let (send_start, recv_start) = channel();
+        let (send_start, recv_start) = message_task();
         let handle = Some(thread::spawn(move || {
             let state = Sentinel::new(int_state, |state, _| {
                 state.running.store(false, Ordering::Release);
@@ -118,7 +118,7 @@ impl<T> ThreadResource<T> {
         F: FnOnce(&mut T) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (sender, task) = channel();
+        let (sender, task) = message_task();
         self.run_command(Command::Run(Box::new(|res| {
             sender.send(f(res)).unwrap_or(())
         })));
@@ -132,7 +132,7 @@ impl<T> ThreadResource<T> {
         F: FnOnce(T) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (sender, receiver) = channel();
+        let (sender, receiver) = message_task();
         self.run_command(Command::Extract(Box::new(|res| {
             if sender.send(f(res)).is_err() {
                 panic!("ThreadResource::extract() receiver dropped");

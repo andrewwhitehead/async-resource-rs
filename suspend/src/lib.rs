@@ -91,7 +91,7 @@ mod oneshot;
 /// and having additional flexibility.
 pub mod task;
 #[doc(hidden)]
-pub use self::task::{channel, notify_once, ready};
+pub use self::task::{message_task, notify_once, ready};
 
 #[doc(hidden)]
 pub use self::task::{Task, TaskSender};

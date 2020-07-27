@@ -4,12 +4,12 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use futures_channel::oneshot as futures_oneshot;
 use oneshot_rs as oneshot;
-use suspend::{block_on, channel};
+use suspend::{block_on, message_task};
 
 fn channel_telephone(threads: usize) {
-    let (sender, mut receiver) = channel();
+    let (sender, mut receiver) = message_task();
     for _ in 0..threads {
-        let (next_send, next_receive) = channel();
+        let (next_send, next_receive) = message_task();
         thread::spawn(move || {
             let result = receiver.wait().unwrap_or(0);
             next_send.send(result).unwrap();

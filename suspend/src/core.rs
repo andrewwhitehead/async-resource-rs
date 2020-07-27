@@ -31,6 +31,10 @@ impl ClearResult {
     pub fn is_none(&self) -> bool {
         matches!(self, Self::NoChange | Self::Updated)
     }
+
+    pub fn is_updated(&self) -> bool {
+        matches!(self, Self::Updated | Self::Removed(_))
+    }
 }
 
 pub(crate) struct InnerSuspend {
@@ -71,16 +75,9 @@ impl InnerSuspend {
         }
     }
 
-    // pub fn close(&self) -> bool {
-    //     match self.clear(CLOSED) {
-    //         ClearResult::Removed(waker) => {
-    //             waker.wake();
-    //             true
-    //         }
-    //         ClearResult::Updated => true,
-    //         ClearResult::NoChange => false,
-    //     }
-    // }
+    pub fn close(&self) -> ClearResult {
+        self.clear(CLOSED)
+    }
 
     pub fn is_waiting(&self) -> bool {
         let s = self.state();
