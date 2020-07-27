@@ -87,7 +87,7 @@ pub use self::helpers::{block_on, block_on_deadline};
 
 mod oneshot;
 
-/// Support for creating pollable `Task` instances, implementing `Future`
+/// Support for creating pollable [`Task`] instances, implementing `Future`
 /// and having additional flexibility.
 pub mod task;
 #[doc(hidden)]
@@ -96,8 +96,6 @@ pub use self::task::{channel, notify_once, ready};
 #[doc(hidden)]
 pub use self::task::{Task, TaskSender};
 
-/// Utilities for creating `Waker` instances.
+/// Utilities for creating [`Waker`](waker::Waker) instances.
 #[macro_use]
 pub mod waker;
-#[cfg(not(feature = "test_clone_waker"))]
-pub(crate) use local_waker;

@@ -2,10 +2,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::task::Waker;
 
 use suspend::{
     local_waker,
-    waker::{waker_from, CloneWake, LocalWaker},
+    waker::{waker_from, LocalWakerRef, Wake},
 };
 
 use pin_utils::pin_mut;
@@ -38,7 +39,7 @@ impl TestWaker {
     }
 }
 
-impl CloneWake for TestWaker {
+impl Wake for TestWaker {
     fn wake_by_ref(&self) {
         self.woken.fetch_add(1, Ordering::SeqCst);
     }
@@ -62,7 +63,7 @@ impl Drop for TestWaker {
 }
 
 #[test]
-fn test_create_wake() {
+fn test_create_and_wake() {
     let first = TestWaker::new();
     let waker = waker_from(first.clone());
     assert_eq!(first.cloned(), 1);
@@ -75,10 +76,28 @@ fn test_create_wake() {
 }
 
 #[test]
+fn test_local_wake_by_ref() {
+    let first = TestWaker::new();
+    pin_mut!(first);
+    let waker = LocalWakerRef::new(first.as_mut());
+    assert_eq!(first.cloned(), 0);
+    assert_eq!(first.dropped(), 0);
+    assert_eq!(first.woken(), 0);
+    Waker::wake_by_ref(&*waker);
+    assert_eq!(first.cloned(), 0);
+    assert_eq!(first.dropped(), 0);
+    assert_eq!(first.woken(), 1);
+    drop(waker);
+    assert_eq!(first.cloned(), 0);
+    assert_eq!(first.dropped(), 0);
+    assert_eq!(first.woken(), 1);
+}
+
+#[test]
 fn test_local_create_wake() {
     let first = TestWaker::new();
     pin_mut!(first);
-    let waker = LocalWaker::new(first.as_mut());
+    let waker = LocalWakerRef::new(first.as_mut());
     assert_eq!(first.cloned(), 0);
     assert_eq!(first.dropped(), 0);
     assert_eq!(first.woken(), 0);

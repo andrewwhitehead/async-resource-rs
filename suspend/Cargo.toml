@@ -16,7 +16,6 @@ path = "src/lib.rs"
 
 [features]
 default = []
-test_clone_waker = []
 
 [dependencies]
 futures-core = "0.3"
@@ -27,15 +26,14 @@ pin-utils = "0.1"
 criterion = "0.3"
 futures-channel = "0.3"
 oneshot_rs = { package = "oneshot", version = "0.1" }
-suspend = { path = ".", features = ["test_clone_waker"] }
 
 [[example]]
 name = "suspend"
 
 [[bench]]
-name = "channels_many"
+name = "channel_many"
 harness = false
 
 [[bench]]
-name = "channels_telephone"
+name = "channel_telephone"
 harness = false

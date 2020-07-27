@@ -45,7 +45,7 @@ pub fn ready<'t, T: Send + 't>(result: T) -> Task<'t, T> {
     Task::from_value(result)
 }
 
-/// A trait allowing for custom `Task` implementations.
+/// A trait allowing for custom [`Task`] implementations.
 pub trait CustomTask<T> {
     /// Indicate that the consumer of the `Task` is going away. The return
     /// value should be `true` if a subsequent poll operation is guaranteed

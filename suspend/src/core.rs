@@ -11,10 +11,10 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use futures_task::{waker, waker_ref, ArcWake, WakerRef};
 use pin_utils::pin_mut;
 
 use super::local_waker;
+use super::waker::{waker_from, waker_ref, ArcWake, WakerRef};
 
 const IDLE: u8 = 0x0;
 const WAIT: u8 = 0x1;
@@ -493,22 +493,22 @@ impl PartialEq for Listener<'_> {
 
 impl Eq for Listener<'_> {}
 
-/// An instance of a notifier for a `Suspend` instance. When notified, the
+/// An instance of a notifier for a [`Suspend`] instance. When notified, the
 /// associated thread or `Future` will be woken if currently suspended.
 pub struct Notifier {
     inner: Arc<InnerSuspend>,
 }
 
 impl Notifier {
-    /// Notify the associated `Suspend` instance, calling its currently
+    /// Notify the associated [`Suspend`] instance, calling its currently
     /// associated waker, if any.
     pub fn notify(&self) {
         self.inner.notify();
     }
 
-    /// Convert the `Notifier` into a `Waker`.
+    /// Convert this instance into a [`Waker`].
     pub fn into_waker(self) -> Waker {
-        waker(self.inner)
+        waker_from(self.inner)
     }
 }
 

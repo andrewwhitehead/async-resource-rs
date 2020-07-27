@@ -1,11 +1,17 @@
+use std::sync::Arc;
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
-/// Convert an instance of a type implementing `CloneWake` into a `Waker`.
-pub fn waker_from<W: CloneWake>(inst: W) -> Waker {
-    CloneWakerImpl::<W>::into_waker(inst)
+use futures_task::waker;
+pub use futures_task::{waker_ref, ArcWake, WakerRef};
+
+/// Convert an instance of a type implementing [`Wake`] or [`ArcWake`] into a
+/// [`Waker`].
+pub fn waker_from<W: IntoWaker>(inst: W) -> Waker {
+    inst.into_waker()
 }
 
-pub trait CloneWake: Clone {
+/// Provide the ability to wake an instance of an owned type.
+pub trait Wake: Clone + Send + Sync {
     fn wake(self) {
         self.wake_by_ref()
     }
@@ -13,19 +19,37 @@ pub trait CloneWake: Clone {
     fn wake_by_ref(&self);
 }
 
-pub(crate) struct CloneWakerImpl<W: CloneWake>(W);
+pub trait IntoWaker {
+    fn into_waker(self) -> Waker;
+}
 
-impl<W: CloneWake> CloneWakerImpl<W> {
+impl<W: Wake> IntoWaker for W {
+    fn into_waker(self) -> Waker {
+        unsafe { Waker::from_raw(WakerImpl::<W>::raw_waker(Box::new(self))) }
+    }
+}
+
+impl<W: ArcWake> IntoWaker for Arc<W> {
+    fn into_waker(self) -> Waker {
+        waker(self)
+    }
+}
+
+impl IntoWaker for Waker {
+    fn into_waker(self) -> Waker {
+        self
+    }
+}
+
+pub(crate) struct WakerImpl<W: Wake>(W);
+
+impl<W: Wake> WakerImpl<W> {
     const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
         Self::clone_waker,
         Self::wake_waker,
         Self::wake_by_ref_waker,
         Self::drop_waker,
     );
-
-    fn into_waker(inst: W) -> Waker {
-        unsafe { Waker::from_raw(Self::raw_waker(Box::new(inst))) }
-    }
 
     fn raw_waker(inst: Box<W>) -> RawWaker {
         let data = Box::into_raw(inst) as *const ();

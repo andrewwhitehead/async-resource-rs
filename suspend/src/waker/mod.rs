@@ -3,19 +3,18 @@ use std::thread::{self, Thread};
 
 #[macro_use]
 mod local;
-#[doc(hidden)]
-pub use local::LocalWaker;
+pub use local::LocalWakerRef;
 
 mod internal;
 
-pub use internal::{waker_from, CloneWake};
+pub use internal::{waker_from, waker_ref, ArcWake, Wake, WakerRef};
 
-/// Create a new `Waker` which will unpark the current thread when woken.
+/// Create a new [`Waker`] which will unpark the current thread when woken.
 pub fn thread_waker() -> Waker {
     waker_from(thread::current())
 }
 
-impl CloneWake for Thread {
+impl Wake for Thread {
     fn wake(self) {
         self.unpark()
     }
