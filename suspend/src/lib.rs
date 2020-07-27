@@ -87,6 +87,13 @@ use futures_core::{
 use futures_task::{waker, waker_ref, ArcWake, WakerRef};
 use pin_utils::pin_mut;
 
+#[macro_use]
+mod waker;
+pub use waker::{current_thread_waker, thread_waker};
+
+#[cfg(feature = "test_clone_waker")]
+pub use waker::{waker_from, CloneWake, LocalWaker};
+
 const IDLE: u8 = 0x0;
 const WAIT: u8 = 0x1;
 const LISTEN: u8 = 0x2;
@@ -97,7 +104,38 @@ pub fn block_on<F>(fut: F) -> F::Output
 where
     F: Future,
 {
-    Suspend::new().wait_on(fut)
+    pin_mut!(fut);
+    local_waker!(thread_waker, thread::current());
+    let mut cx = Context::from_waker(&*thread_waker);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => break result,
+            Poll::Pending => thread::park(),
+        }
+    }
+}
+
+/// A convenience method to evaluate a `Future`, blocking the current thread
+/// until it is resolved or the timeout expires.
+pub fn block_on_deadline<F>(mut fut: F, expire: Instant) -> Result<F::Output, F>
+where
+    F: Future + Unpin,
+{
+    let mut pin_fut = Pin::new(&mut fut);
+    local_waker!(thread_waker, thread::current());
+    let mut cx = Context::from_waker(&*thread_waker);
+    loop {
+        match pin_fut.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => break Ok(result),
+            Poll::Pending => {
+                if let Some(dur) = expire.checked_duration_since(Instant::now()) {
+                    thread::park_timeout(dur);
+                } else {
+                    break Err(fut);
+                }
+            }
+        }
+    }
 }
 
 /// Create a new one-shot message pair consisting of a
@@ -138,24 +176,6 @@ pub fn ready<'t, T: Send + 't>(result: T) -> Task<'t, T> {
     Task::from_value(result)
 }
 
-enum InnerNotify {
-    Thread(thread::Thread),
-    Waker(Waker),
-}
-
-impl InnerNotify {
-    pub fn call(self) {
-        match self {
-            Self::Thread(thread) => {
-                thread.unpark();
-            }
-            Self::Waker(waker) => {
-                waker.wake();
-            }
-        }
-    }
-}
-
 /// An error indicating that the [`TaskSender`] side of a one-shot channel was
 /// dropped without sending a result.
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -183,7 +203,7 @@ impl Display for TimedOut {
 impl std::error::Error for TimedOut {}
 
 enum ClearResult {
-    Removed(InnerNotify),
+    Removed(Waker),
     NoChange,
     Updated,
 }
@@ -195,15 +215,15 @@ impl ClearResult {
 }
 
 struct InnerSuspend {
-    notify: UnsafeCell<MaybeUninit<InnerNotify>>,
     state: AtomicU8,
+    waker: UnsafeCell<MaybeUninit<Waker>>,
 }
 
 impl InnerSuspend {
     pub const fn new(state: u8) -> Self {
         Self {
-            notify: UnsafeCell::new(MaybeUninit::uninit()),
             state: AtomicU8::new(state),
+            waker: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 
@@ -217,7 +237,7 @@ impl InnerSuspend {
 
     pub fn clear(&self, newval: u8) -> ClearResult {
         match self.state.swap(newval, Ordering::Release) {
-            LISTEN => ClearResult::Removed(unsafe { self.vacate() }),
+            LISTEN => ClearResult::Removed(unsafe { self.vacate_waker() }),
             state => {
                 if state == newval {
                     ClearResult::NoChange
@@ -233,8 +253,8 @@ impl InnerSuspend {
         s == WAIT || s == LISTEN
     }
 
-    /// Try to start listening with a new notifier
-    pub fn listen(&self, notify: InnerNotify) -> bool {
+    /// Try to start listening with a new waker
+    pub fn listen(&self, waker: &Waker) -> bool {
         match self.state() {
             IDLE => {
                 // not currently acquired
@@ -252,7 +272,7 @@ impl InnerSuspend {
                     ) {
                         Ok(_) => {
                             break unsafe {
-                                self.vacate();
+                                self.vacate_waker();
                             }
                         }
                         Err(WAIT) => {
@@ -274,14 +294,14 @@ impl InnerSuspend {
             _ => panic!("Invalid state"),
         }
         unsafe {
-            self.update(notify);
+            self.update_waker(waker.clone());
         }
         match self.state.compare_and_swap(WAIT, LISTEN, Ordering::AcqRel) {
             WAIT => true,
             IDLE => {
                 // notify was called while storing
                 unsafe {
-                    self.vacate();
+                    self.vacate_waker();
                 }
                 false
             }
@@ -293,8 +313,8 @@ impl InnerSuspend {
     /// Returns true if there was an active listener.
     pub fn notify(&self) -> bool {
         match self.clear(IDLE) {
-            ClearResult::Removed(notify) => {
-                notify.call();
+            ClearResult::Removed(waker) => {
+                waker.wake();
                 true
             }
             ClearResult::Updated => true,
@@ -317,7 +337,7 @@ impl InnerSuspend {
             _ => (),
         }
 
-        if self.listen(InnerNotify::Waker(cx.waker().clone())) {
+        if self.listen(cx.waker()) {
             Poll::Pending
         } else {
             // already notified
@@ -329,16 +349,17 @@ impl InnerSuspend {
         self.state.load(Ordering::Acquire)
     }
 
-    pub unsafe fn update(&self, notify: InnerNotify) {
-        self.notify.get().write(MaybeUninit::new(notify))
+    pub unsafe fn update_waker(&self, waker: Waker) {
+        self.waker.get().write(MaybeUninit::new(waker))
     }
 
-    pub unsafe fn vacate(&self) -> InnerNotify {
-        self.notify.get().read().assume_init()
+    pub unsafe fn vacate_waker(&self) -> Waker {
+        self.waker.get().read().assume_init()
     }
 
     pub fn wait(&self) {
-        if !self.listen(InnerNotify::Thread(thread::current())) {
+        local_waker!(thread_waker, thread::current());
+        if !self.listen(&*thread_waker) {
             // already notified
             return;
         }
@@ -351,7 +372,8 @@ impl InnerSuspend {
     }
 
     pub fn wait_deadline(&self, expire: Instant) -> bool {
-        if !self.listen(InnerNotify::Thread(thread::current())) {
+        local_waker!(thread_waker, thread::current());
+        if !self.listen(&*thread_waker) {
             // already notified
             return true;
         }
@@ -656,41 +678,42 @@ pub trait CustomTask<T> {
     fn poll(&mut self, cx: &mut Context) -> Poll<T>;
 
     fn wait(&mut self) -> T {
-        let mut suspend = Suspend::new();
+        local_waker!(thread_waker, thread::current());
+        let mut cx = Context::from_waker(&*thread_waker);
         loop {
-            let mut listen = suspend.listen();
-            let waker = listen.waker_ref();
-            let mut cx = Context::from_waker(&*waker);
             match self.poll(&mut cx) {
-                Poll::Pending => listen.wait(),
-                Poll::Ready(result) => return result,
+                Poll::Pending => thread::park(),
+                Poll::Ready(result) => break result,
             }
         }
     }
 
     fn wait_deadline(&mut self, expire: Instant) -> Result<T, TimedOut> {
-        let mut suspend = Suspend::new();
+        local_waker!(thread_waker, thread::current());
+        let mut cx = Context::from_waker(&*thread_waker);
         loop {
-            let mut listen = suspend.listen();
-            let waker = listen.waker_ref();
-            let mut cx = Context::from_waker(&*waker);
             match self.poll(&mut cx) {
+                Poll::Ready(result) => break Ok(result),
                 Poll::Pending => {
-                    if !listen.wait_deadline(expire) {
-                        return Err(TimedOut);
+                    if let Some(dur) = expire.checked_duration_since(Instant::now()) {
+                        thread::park_timeout(dur);
+                    } else {
+                        break Err(TimedOut);
                     }
                 }
-                Poll::Ready(result) => return Ok(result),
             }
         }
     }
 }
 
-pub type BoxedCustomTask<'t, T> = Box<dyn CustomTask<T> + Send + 't>;
+pub type BoxCustomTask<'t, T> = Box<dyn CustomTask<T> + Send + 't>;
+
+pub type BoxFusedFuture<'t, T> = Pin<Box<dyn FusedFuture<Output = T> + Send + 't>>;
 
 enum TaskState<'t, T> {
-    Custom(BoxedCustomTask<'t, T>),
+    Custom(BoxCustomTask<'t, T>),
     Future(BoxFuture<'t, T>),
+    FusedFuture(BoxFusedFuture<'t, T>),
     Poll(PollFn<'t, T>),
     Done,
 }
@@ -704,13 +727,19 @@ impl<'t, T> TaskState<'t, T> {
     }
 
     fn is_terminated(&self) -> bool {
-        matches!(self, Self::Done)
+        match self {
+            Self::Custom(inner) => inner.is_terminated(),
+            Self::FusedFuture(fut) => fut.is_terminated(),
+            Self::Done => true,
+            _ => false,
+        }
     }
 
     fn poll_state(&mut self, cx: &mut Context) -> Poll<T> {
         let result = match self {
             Self::Custom(inner) => inner.poll(cx),
             Self::Future(fut) => fut.as_mut().poll(cx),
+            Self::FusedFuture(fut) => fut.as_mut().poll(cx),
             Self::Poll(poll) => poll(cx),
             Self::Done => return Poll::Pending,
         };
@@ -723,14 +752,14 @@ impl<'t, T> TaskState<'t, T> {
     pub fn wait(self) -> T {
         match self {
             Self::Custom(mut inner) => inner.wait(),
-            _ => Suspend::new().wait_on(self),
+            _ => block_on(self),
         }
     }
 
     pub fn wait_deadline(mut self, expire: Instant) -> Result<T, Self> {
         match &mut self {
             TaskState::Custom(inner) => inner.wait_deadline(expire).map_err(|_| self),
-            _ => Suspend::new().wait_on_deadline(self, expire),
+            _ => block_on_deadline(self, expire),
         }
     }
 }
@@ -757,7 +786,7 @@ impl<'t, T> Task<'t, T> {
     where
         C: CustomTask<T> + Send + 't,
     {
-        Self::from(Box::new(task) as BoxedCustomTask<'t, T>)
+        Self::from(Box::new(task) as BoxCustomTask<'t, T>)
     }
 
     /// Create a new `Task` from a function returning `Poll<T>`. If the
@@ -768,6 +797,15 @@ impl<'t, T> Task<'t, T> {
         F: FnMut(&mut Context) -> Poll<T> + Send + 't,
     {
         Self::from(Box::new(f) as PollFn<'t, T>)
+    }
+
+    /// Create a new `Task` from a `Future<T> + FusedFuture`. If the future
+    /// is already boxed, then it would be more efficient to use `Task::from`.
+    pub fn from_fused_fut<F>(f: F) -> Self
+    where
+        F: FusedFuture<Output = T> + Send + 't,
+    {
+        Self::from(Box::pin(f) as BoxFusedFuture<'t, T>)
     }
 
     /// Create a new `Task` from a `Future<T>`. If the future is already boxed,
@@ -875,10 +913,26 @@ impl<T> PartialEq for Task<'_, T> {
 
 impl<T> Eq for Task<'_, T> {}
 
+impl<'t, T> From<BoxCustomTask<'t, T>> for Task<'t, T> {
+    fn from(inner: BoxCustomTask<'t, T>) -> Self {
+        Task {
+            state: TaskState::Custom(inner),
+        }
+    }
+}
+
 impl<'t, T> From<BoxFuture<'t, T>> for Task<'t, T> {
     fn from(fut: BoxFuture<'t, T>) -> Self {
         Self {
             state: TaskState::Future(fut),
+        }
+    }
+}
+
+impl<'t, T> From<BoxFusedFuture<'t, T>> for Task<'t, T> {
+    fn from(fut: BoxFusedFuture<'t, T>) -> Self {
+        Self {
+            state: TaskState::FusedFuture(fut),
         }
     }
 }
@@ -902,14 +956,6 @@ impl<'t, T> Future for Task<'t, T> {
 impl<'t, T> FusedFuture for Task<'t, T> {
     fn is_terminated(&self) -> bool {
         self.state.is_terminated()
-    }
-}
-
-impl<'t, T> From<BoxedCustomTask<'t, T>> for Task<'t, T> {
-    fn from(inner: BoxedCustomTask<'t, T>) -> Self {
-        Task {
-            state: TaskState::Custom(inner),
-        }
     }
 }
 

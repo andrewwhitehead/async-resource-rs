@@ -14,6 +14,9 @@ keywords = ["park", "future", "stream", "thread", "waker"]
 name = "suspend"
 path = "src/lib.rs"
 
+[features]
+test_clone_waker = []
+
 [dependencies]
 futures-core = "0.3"
 futures-task = "0.3"
@@ -23,6 +26,7 @@ pin-utils = "0.1"
 criterion = "0.3"
 futures-channel = "0.3"
 oneshot_rs = { package = "oneshot", version = "0.1" }
+suspend = { path = ".", features = ["test_clone_waker"] }
 
 [[example]]
 name = "suspend"
