@@ -6,7 +6,7 @@ use futures_channel::oneshot as futures_oneshot;
 use oneshot_rs as oneshot;
 use suspend::{block_on, message_task};
 
-fn channel_telephone(threads: usize) {
+fn message_telephone(threads: usize) {
     let (sender, mut receiver) = message_task();
     for _ in 0..threads {
         let (next_send, next_receive) = message_task();
@@ -54,10 +54,10 @@ fn oneshot_telephone(threads: usize) {
 fn bench_telephone(c: &mut Criterion) {
     let count = 1000;
     c.bench_with_input(
-        BenchmarkId::new("channel-telephone", count),
+        BenchmarkId::new("message-telephone", count),
         &count,
         |b, &s| {
-            b.iter(|| channel_telephone(s));
+            b.iter(|| message_telephone(s));
         },
     );
     c.bench_with_input(
