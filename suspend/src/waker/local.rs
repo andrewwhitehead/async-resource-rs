@@ -55,9 +55,9 @@ impl<W: Wake> Deref for LocalWakerRef<'_, W> {
 
 #[macro_export]
 /// Pin an instance of a type implementing [`Wake`](crate::waker::Wake) to
-/// the stack, and provide a [`LocalWakerRef`](crate::LocalWakerRef) which
-/// dereferences to a [`Waker`](crate::waker::Waker) for the value. If and
-/// when the Waker is cloned, the value will be cloned to the heap as well.
+/// the stack, and provide a [`LocalWakerRef`](crate::waker::LocalWakerRef)
+/// which dereferences to a [`Waker`](crate::waker::Waker) for the value. If
+/// and when the Waker is cloned, the value will be cloned to the heap as well.
 macro_rules! local_waker {
     ($x:ident, $y:expr) => {
         // borrowed from pin-project-lite:

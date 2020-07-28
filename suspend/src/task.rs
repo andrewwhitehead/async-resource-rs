@@ -3,15 +3,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use futures_core::future::{BoxFuture, FusedFuture};
 
 use super::core::{InnerSuspend, Notifier};
-use super::error::{Incomplete, TimedOut};
-use super::helpers::{block_on, block_on_deadline};
-use super::local_waker;
+use super::error::Incomplete;
+use super::helpers::{block_on, block_on_deadline, block_on_poll, block_on_poll_deadline};
 use super::oneshot::{Channel, TaskReceiver};
 
 pub use super::oneshot::TaskSender;
@@ -19,9 +17,11 @@ pub use super::oneshot::TaskSender;
 /// A polling function equivalent to `Future::poll`.
 pub type PollFn<'a, T> = Box<dyn FnMut(&mut Context) -> Poll<T> + Send + 'a>;
 
-pub type BoxCustomTask<'t, T> = Box<dyn CustomTask<T> + Send + 't>;
+/// A boxed `CancelFuture`.
+pub type BoxCancelFuture<'a, T> = Pin<Box<dyn CancelFuture<T> + Send + 'a>>;
 
-pub type BoxFusedFuture<'t, T> = Pin<Box<dyn FusedFuture<Output = T> + Send + 't>>;
+/// A boxed `FusedFuture`.
+pub type BoxFusedFuture<'a, T> = Pin<Box<dyn FusedFuture<Output = T> + Send + 'a>>;
 
 /// Create a new one-shot message pair consisting of a
 /// [`TaskSender<T>`](TaskSender) and a
@@ -45,12 +45,13 @@ pub fn ready<'t, T: Send + 't>(result: T) -> Task<'t, T> {
     Task::from_value(result)
 }
 
-/// A trait allowing for custom [`Task`] implementations.
-pub trait CustomTask<T> {
-    /// Indicate that the consumer of the `Task` is going away. The return
+/// A trait allowing for [`Task`] implementations with guaranteed delivery
+/// or non-delivery of the result.
+pub trait CancelFuture<T>: Future<Output = T> {
+    /// Indicate that the consumer of the `Future` is going away. The return
     /// value should be `true` if a subsequent poll operation is guaranteed
     /// to return a `Ready` value.
-    fn cancel(&mut self) -> bool {
+    fn cancel(self: Pin<&mut Self>) -> bool {
         false
     }
 
@@ -59,43 +60,10 @@ pub trait CustomTask<T> {
     fn is_terminated(&self) -> bool {
         false
     }
-
-    /// Poll the instance for a result.
-    fn poll(&mut self, cx: &mut Context) -> Poll<T>;
-
-    /// Block on a result.
-    fn wait(&mut self) -> T {
-        local_waker!(thread_waker, thread::current());
-        let mut cx = Context::from_waker(&*thread_waker);
-        loop {
-            match self.poll(&mut cx) {
-                Poll::Pending => thread::park(),
-                Poll::Ready(result) => break result,
-            }
-        }
-    }
-
-    /// Block on a result with a deadline.
-    fn wait_deadline(&mut self, expire: Instant) -> Result<T, TimedOut> {
-        local_waker!(thread_waker, thread::current());
-        let mut cx = Context::from_waker(&*thread_waker);
-        loop {
-            match self.poll(&mut cx) {
-                Poll::Ready(result) => break Ok(result),
-                Poll::Pending => {
-                    if let Some(dur) = expire.checked_duration_since(Instant::now()) {
-                        thread::park_timeout(dur);
-                    } else {
-                        break Err(TimedOut);
-                    }
-                }
-            }
-        }
-    }
 }
 
 enum TaskState<'t, T> {
-    Custom(BoxCustomTask<'t, T>),
+    CancelFuture(BoxCancelFuture<'t, T>),
     Future(BoxFuture<'t, T>),
     FusedFuture(BoxFusedFuture<'t, T>),
     Poll(PollFn<'t, T>),
@@ -106,7 +74,7 @@ enum TaskState<'t, T> {
 impl<'t, T> TaskState<'t, T> {
     fn cancel(&mut self) -> bool {
         match self {
-            Self::Custom(inner) => inner.cancel(),
+            Self::CancelFuture(fut) => fut.as_mut().cancel(),
             Self::Receiver(recv) => recv.cancel(),
             _ => false,
         }
@@ -114,7 +82,7 @@ impl<'t, T> TaskState<'t, T> {
 
     fn is_terminated(&self) -> bool {
         match self {
-            Self::Custom(inner) => inner.is_terminated(),
+            Self::CancelFuture(fut) => fut.is_terminated(),
             Self::FusedFuture(fut) => fut.is_terminated(),
             Self::Terminated => true,
             _ => false,
@@ -123,9 +91,9 @@ impl<'t, T> TaskState<'t, T> {
 
     fn poll_state(&mut self, cx: &mut Context) -> Poll<T> {
         match self {
-            Self::Custom(inner) => inner.poll(cx),
-            Self::Future(fut) => fut.as_mut().poll(cx),
+            Self::CancelFuture(fut) => fut.as_mut().poll(cx),
             Self::FusedFuture(fut) => fut.as_mut().poll(cx),
+            Self::Future(fut) => fut.as_mut().poll(cx),
             Self::Poll(poll) => poll(cx),
             Self::Receiver(recv) => recv.poll(cx),
             Self::Terminated => return Poll::Pending,
@@ -138,19 +106,32 @@ impl<'t, T> TaskState<'t, T> {
 
     pub fn wait(self) -> T {
         match self {
-            Self::Custom(mut inner) => inner.wait(),
+            Self::CancelFuture(fut) => block_on(fut),
+            Self::FusedFuture(fut) => block_on(fut),
+            Self::Future(fut) => block_on(fut),
+            Self::Poll(poll_fn) => block_on_poll(poll_fn),
             Self::Receiver(mut recv) => recv.wait(),
-            _ => block_on(self),
+            Self::Terminated => panic!("Cannot block on terminated task"),
         }
     }
 
     pub fn wait_deadline(self, expire: Instant) -> Result<T, Self> {
         match self {
-            Self::Custom(mut inner) => inner.wait_deadline(expire).map_err(|_| Self::Custom(inner)),
+            Self::CancelFuture(fut) => {
+                block_on_deadline(fut, expire).map_err(|fut| Self::CancelFuture(fut))
+            }
+            Self::FusedFuture(fut) => {
+                block_on_deadline(fut, expire).map_err(|fut| Self::FusedFuture(fut))
+            }
+            Self::Future(fut) => block_on_deadline(fut, expire).map_err(|fut| Self::Future(fut)),
+            Self::Poll(mut poll_fn) => match block_on_poll_deadline(&mut poll_fn, expire) {
+                Ok(r) => Ok(r),
+                Err(_) => Err(Self::Poll(poll_fn)),
+            },
             Self::Receiver(mut recv) => {
                 recv.wait_deadline(expire).map_err(|_| Self::Receiver(recv))
             }
-            _ => block_on_deadline(self, expire),
+            Self::Terminated => Err(self),
         }
     }
 }
@@ -171,13 +152,13 @@ pub struct Task<'t, T> {
 }
 
 impl<'t, T> Task<'t, T> {
-    /// Create a new `Task` from a `CustomTask<T>`. If the custom task is
+    /// Create a new `Task` from a `CancelFuture<T>`. If the future is
     /// already boxed, then it would be more efficient to use `Task::from`.
-    pub fn from_custom<C>(task: C) -> Self
+    pub fn from_cancel_fut<C>(task: C) -> Self
     where
-        C: CustomTask<T> + Send + 't,
+        C: CancelFuture<T> + Send + 't,
     {
-        Self::from(Box::new(task) as BoxCustomTask<'t, T>)
+        Self::from(Box::pin(task) as BoxCancelFuture<'t, T>)
     }
 
     /// Create a new `Task` from a `Future<T> + FusedFuture`. If the future
@@ -223,9 +204,10 @@ impl<'t, T> Task<'t, T> {
         })
     }
 
-    /// In the case of a `CustomTask` implementation, this method can be used
-    /// to indicate to the `TaskSender` that the receiver will be dropped. The
-    /// next poll or wait on the `Task` should not block if `true` is returned.
+    /// In the case of a `CancelFuture` or `Receiver` implementation, this
+    /// method can be used to indicate to the sender that the Task will be
+    /// dropped. The next poll or wait on the `Task` should not block if
+    /// `true` is returned.
     pub fn cancel(&mut self) -> bool {
         self.state.cancel()
     }
@@ -313,10 +295,10 @@ impl<T> PartialEq for Task<'_, T> {
 
 impl<T> Eq for Task<'_, T> {}
 
-impl<'t, T> From<BoxCustomTask<'t, T>> for Task<'t, T> {
-    fn from(inner: BoxCustomTask<'t, T>) -> Self {
+impl<'t, T> From<BoxCancelFuture<'t, T>> for Task<'t, T> {
+    fn from(inner: BoxCancelFuture<'t, T>) -> Self {
         Task {
-            state: TaskState::Custom(inner),
+            state: TaskState::CancelFuture(inner),
         }
     }
 }

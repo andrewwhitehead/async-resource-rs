@@ -57,7 +57,7 @@ fn iter_stream_basic() {
             self.0 = val + 1;
             if val % 2 == 0 {
                 // testing that the waker functions as expected
-                cx.waker().clone().wake();
+                cx.waker().wake_by_ref();
                 Poll::Pending
             } else {
                 Poll::Ready(Some(val))

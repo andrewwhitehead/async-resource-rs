@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 
 use pin_utils::pin_mut;
 
-use super::local_waker;
-use super::waker::{waker_from, waker_ref, ArcWake, WakerRef};
+use super::waker::{waker_from, waker_ref, ArcWake, WakerRef, THREAD_WAKER};
 
 const IDLE: u8 = 0x0;
 const WAIT: u8 = 0x1;
@@ -198,8 +197,7 @@ impl InnerSuspend {
     }
 
     pub fn wait(&self) {
-        local_waker!(thread_waker, thread::current());
-        if !self.listen(&*thread_waker) {
+        if !THREAD_WAKER.with(|waker| self.listen(waker)) {
             // already notified
             return;
         }
@@ -213,8 +211,7 @@ impl InnerSuspend {
     }
 
     pub fn wait_deadline(&self, expire: Instant) -> bool {
-        local_waker!(thread_waker, thread::current());
-        if !self.listen(&*thread_waker) {
+        if !THREAD_WAKER.with(|waker| self.listen(waker)) {
             // already notified
             return true;
         }
