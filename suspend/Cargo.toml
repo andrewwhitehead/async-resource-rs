@@ -25,10 +25,15 @@ pin-utils = "0.1"
 [dev-dependencies]
 criterion = "0.3"
 futures-channel = "0.3"
+futures-executor = "0.3"
 oneshot_rs = { package = "oneshot", version = "0.1" }
 
 [[example]]
 name = "suspend"
+
+[[bench]]
+name = "block_on"
+harness = false
 
 [[bench]]
 name = "oneshot_send"
