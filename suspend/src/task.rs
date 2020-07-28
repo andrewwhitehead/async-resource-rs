@@ -12,7 +12,7 @@ use super::core::{InnerSuspend, Notifier};
 use super::error::{Incomplete, TimedOut};
 use super::helpers::{block_on, block_on_deadline};
 use super::local_waker;
-use super::oneshot::Channel;
+use super::oneshot::{Channel, TaskReceiver};
 
 pub use super::oneshot::TaskSender;
 
@@ -29,7 +29,7 @@ pub type BoxFusedFuture<'t, T> = Pin<Box<dyn FusedFuture<Output = T> + Send + 't
 /// or the `TaskSender` is dropped, the `Task` will be resolved.
 pub fn message_task<'t, T: Send + 'static>() -> (TaskSender<T>, Task<'t, Result<T, Incomplete>>) {
     let (sender, receiver) = Channel::pair();
-    (sender, Task::from_custom(receiver))
+    (sender, Task::from(receiver))
 }
 
 /// Create a new single-use [`Notifier`] and a corresponding [`Task`]. Once
@@ -99,6 +99,7 @@ enum TaskState<'t, T> {
     Future(BoxFuture<'t, T>),
     FusedFuture(BoxFusedFuture<'t, T>),
     Poll(PollFn<'t, T>),
+    Receiver(TaskReceiver<T>),
     Terminated,
 }
 
@@ -106,6 +107,7 @@ impl<'t, T> TaskState<'t, T> {
     fn cancel(&mut self) -> bool {
         match self {
             Self::Custom(inner) => inner.cancel(),
+            Self::Receiver(recv) => recv.cancel(),
             _ => false,
         }
     }
@@ -125,6 +127,7 @@ impl<'t, T> TaskState<'t, T> {
             Self::Future(fut) => fut.as_mut().poll(cx),
             Self::FusedFuture(fut) => fut.as_mut().poll(cx),
             Self::Poll(poll) => poll(cx),
+            Self::Receiver(recv) => recv.poll(cx),
             Self::Terminated => return Poll::Pending,
         }
         .map(|r| {
@@ -136,13 +139,17 @@ impl<'t, T> TaskState<'t, T> {
     pub fn wait(self) -> T {
         match self {
             Self::Custom(mut inner) => inner.wait(),
+            Self::Receiver(mut recv) => recv.wait(),
             _ => block_on(self),
         }
     }
 
-    pub fn wait_deadline(mut self, expire: Instant) -> Result<T, Self> {
-        match &mut self {
-            TaskState::Custom(inner) => inner.wait_deadline(expire).map_err(|_| self),
+    pub fn wait_deadline(self, expire: Instant) -> Result<T, Self> {
+        match self {
+            Self::Custom(mut inner) => inner.wait_deadline(expire).map_err(|_| Self::Custom(inner)),
+            Self::Receiver(mut recv) => {
+                recv.wait_deadline(expire).map_err(|_| Self::Receiver(recv))
+            }
             _ => block_on_deadline(self, expire),
         }
     }
@@ -334,6 +341,14 @@ impl<'t, T> From<PollFn<'t, T>> for Task<'t, T> {
     fn from(poll: PollFn<'t, T>) -> Self {
         Self {
             state: TaskState::Poll(poll),
+        }
+    }
+}
+
+impl<'t, T> From<TaskReceiver<T>> for Task<'t, T> {
+    fn from(recv: TaskReceiver<T>) -> Self {
+        Self {
+            state: TaskState::Receiver(recv),
         }
     }
 }

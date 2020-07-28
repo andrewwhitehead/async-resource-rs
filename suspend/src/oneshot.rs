@@ -6,7 +6,6 @@ use std::time::Instant;
 
 use super::core::InnerSuspend;
 use super::error::{Incomplete, TimedOut};
-use super::task::CustomTask;
 
 pub(crate) struct Channel<T> {
     data: UnsafeCell<MaybeUninit<T>>,
@@ -116,21 +115,21 @@ pub(crate) struct TaskReceiver<T> {
     channel: Arc<Channel<T>>,
 }
 
-impl<T: Send> CustomTask<T> for TaskReceiver<T> {
-    fn cancel(&mut self) -> bool {
+impl<T> TaskReceiver<T> {
+    pub fn cancel(&mut self) -> bool {
         self.channel.close_recv();
         true
     }
 
-    fn poll(&mut self, cx: &mut Context) -> Poll<T> {
+    pub fn poll(&mut self, cx: &mut Context) -> Poll<T> {
         self.channel.poll(cx)
     }
 
-    fn wait(&mut self) -> T {
+    pub fn wait(&mut self) -> T {
         self.channel.wait()
     }
 
-    fn wait_deadline(&mut self, expire: Instant) -> Result<T, TimedOut> {
+    pub fn wait_deadline(&mut self, expire: Instant) -> Result<T, TimedOut> {
         self.channel.wait_deadline(expire)
     }
 }
