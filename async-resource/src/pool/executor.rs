@@ -45,7 +45,7 @@ mod multitask_exec {
                     let running = running.clone();
                     (
                         thread::spawn(move || loop {
-                            let mut listener = suspend.listen();
+                            let listener = suspend.listen();
                             if !ticker.tick() {
                                 if !running.load(Ordering::Acquire) {
                                     break;

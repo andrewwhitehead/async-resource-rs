@@ -9,8 +9,9 @@ use futures_core::future::{BoxFuture, FusedFuture};
 
 use super::core::{InnerSuspend, Notifier};
 use super::error::Incomplete;
-use super::helpers::{block_on, block_on_deadline, block_on_poll, block_on_poll_deadline};
+use super::helpers::{block_on, block_on_deadline};
 use super::oneshot::{Channel, TaskReceiver};
+use super::thread::{thread_suspend, thread_suspend_deadline};
 
 pub use super::oneshot::TaskSender;
 
@@ -109,7 +110,7 @@ impl<'t, T> TaskState<'t, T> {
             Self::CancelFuture(fut) => block_on(fut),
             Self::FusedFuture(fut) => block_on(fut),
             Self::Future(fut) => block_on(fut),
-            Self::Poll(poll_fn) => block_on_poll(poll_fn),
+            Self::Poll(poll_fn) => thread_suspend(poll_fn),
             Self::Receiver(mut recv) => recv.wait(),
             Self::Terminated => panic!("Cannot block on terminated task"),
         }
@@ -124,9 +125,9 @@ impl<'t, T> TaskState<'t, T> {
                 block_on_deadline(fut, expire).map_err(|fut| Self::FusedFuture(fut))
             }
             Self::Future(fut) => block_on_deadline(fut, expire).map_err(|fut| Self::Future(fut)),
-            Self::Poll(mut poll_fn) => match block_on_poll_deadline(&mut poll_fn, expire) {
-                Ok(r) => Ok(r),
-                Err(_) => Err(Self::Poll(poll_fn)),
+            Self::Poll(mut poll_fn) => match thread_suspend_deadline(&mut poll_fn, Some(expire)) {
+                Poll::Ready(r) => Ok(r),
+                Poll::Pending => Err(Self::Poll(poll_fn)),
             },
             Self::Receiver(mut recv) => {
                 recv.wait_deadline(expire).map_err(|_| Self::Receiver(recv))

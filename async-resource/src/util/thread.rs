@@ -83,7 +83,7 @@ impl<T> ThreadResource<T> {
                 None => return,
             };
             loop {
-                let mut listen = suspend.listen();
+                let listen = suspend.listen();
                 match state.next.try_take() {
                     Ok(Command::Run(f)) => {
                         f(&mut res);

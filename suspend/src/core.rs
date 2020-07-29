@@ -23,16 +23,16 @@ const CLOSED: u8 = 0x3;
 pub(crate) enum ClearResult {
     Removed(Waker),
     NoChange,
-    Updated,
+    Updated(u8),
 }
 
 impl ClearResult {
-    pub fn is_none(&self) -> bool {
-        matches!(self, Self::NoChange | Self::Updated)
+    pub fn is_removed(&self) -> bool {
+        matches!(self, Self::Removed(_))
     }
 
     pub fn is_updated(&self) -> bool {
-        matches!(self, Self::Updated | Self::Removed(_))
+        matches!(self, Self::Updated(_) | Self::Removed(_))
     }
 }
 
@@ -68,7 +68,7 @@ impl InnerSuspend {
                 if state == newval {
                     ClearResult::NoChange
                 } else {
-                    ClearResult::Updated
+                    ClearResult::Updated(state)
                 }
             }
         }
@@ -148,7 +148,7 @@ impl InnerSuspend {
                 waker.wake();
                 true
             }
-            ClearResult::Updated => true,
+            ClearResult::Updated(_) => true,
             ClearResult::NoChange => false,
         }
     }
@@ -160,7 +160,7 @@ impl InnerSuspend {
             }
             LISTEN => {
                 // try to clear existing waker and move back to wait state
-                if self.set_waiting().is_none() {
+                if !self.set_waiting().is_removed() {
                     // already taken (thread was pre-empted)
                     return Poll::Ready(());
                 }
@@ -331,7 +331,7 @@ impl Suspend {
         loop {
             match self.poll(fut.as_mut()) {
                 Ok(result) => break result,
-                Err(mut listen) => listen.wait(),
+                Err(listen) => listen.wait(),
             }
         }
     }
@@ -346,8 +346,8 @@ impl Suspend {
         loop {
             match self.poll_unpin(&mut fut) {
                 Ok(result) => break Ok(result),
-                Err(mut listen) => {
-                    if !listen.wait_deadline(expire) {
+                Err(listen) => {
+                    if listen.wait_deadline(expire).is_err() {
                         break Err(fut);
                     }
                 }
@@ -426,7 +426,7 @@ impl Listener<'_> {
 
     /// Wait for a notification on the associated `Suspend` instance, parking
     /// the current thread until that time.
-    pub fn wait(&mut self) {
+    pub fn wait(self) {
         self.inner.wait()
     }
 
@@ -434,16 +434,24 @@ impl Listener<'_> {
     /// the current thread until the result is available or the deadline is
     /// reached. If a timeout occurs then `false` is returned, otherwise
     /// `true`.
-    pub fn wait_deadline(&mut self, expire: Instant) -> bool {
-        self.inner.wait_deadline(expire)
+    pub fn wait_deadline(self, expire: Instant) -> Result<(), Self> {
+        if self.inner.wait_deadline(expire) {
+            Ok(())
+        } else {
+            Err(self)
+        }
     }
 
     /// Wait for a notification on the associated `Suspend` instance, parking
     /// the current thread until the result is available or the timeout
     /// expires. If a timeout does occur then `false` is returned, otherwise
     /// `true`.
-    pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        self.inner.wait_timeout(timeout)
+    pub fn wait_timeout(self, timeout: Duration) -> Result<(), Self> {
+        if self.inner.wait_timeout(timeout) {
+            Ok(())
+        } else {
+            Err(self)
+        }
     }
 
     /// Get a `WakerRef` associated with the `Listener`.

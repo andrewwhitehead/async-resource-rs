@@ -189,7 +189,7 @@ impl<T: Send, E> PoolInternal<T, E> {
 
             // Set the waiter state to Wait.
             // If anything is subsequently added to the queues, it will move to Idle.
-            let mut listener = suspend.listen();
+            let listener = suspend.listen();
 
             while let Some(event) = inner.shared.pop_event() {
                 match event {
@@ -283,7 +283,7 @@ impl<T: Send, E> PoolInternal<T, E> {
             }
 
             if let Some(next_check) = next_check {
-                listener.wait_deadline(next_check);
+                listener.wait_deadline(next_check).unwrap_or(());
             } else {
                 listener.wait();
             }

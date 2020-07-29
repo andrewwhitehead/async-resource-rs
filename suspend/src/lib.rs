@@ -96,6 +96,8 @@ pub use self::task::{message_task, notify_once, ready};
 #[doc(hidden)]
 pub use self::task::{Task, TaskSender};
 
+pub mod thread;
+
 /// Utilities for creating [`Waker`](waker::Waker) instances.
 #[macro_use]
 pub mod waker;

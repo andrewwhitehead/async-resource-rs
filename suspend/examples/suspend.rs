@@ -20,10 +20,10 @@ fn main() {
             listen.await
         });
 
-        let mut listen = susp.listen();
+        let listener = susp.listen();
         exchange1.store(2, Ordering::Release);
         // block on a notification
-        listen.wait()
+        listener.wait()
     });
 
     thread::spawn(move || {
