@@ -11,7 +11,7 @@ use std::time::Instant;
 thread_local! {
     static THREAD_SUSPEND: (Arc<ThreadWake>, Waker, Cell<usize>) = {
         let tw = Arc::new(ThreadWake::new(0, thread::current()));
-        let waker = tw.waker();
+        let waker = tw.clone().into_waker();
         (tw, waker, Cell::new(0))
     };
 }
@@ -36,7 +36,7 @@ where
         } else {
             // if thread_wake is not idle, then this function has been re-entered while waiting
             let thread_wake = Arc::new(ThreadWake::new(seqno, thread_wake.thread.clone()));
-            let waker = thread_wake.waker();
+            let waker = thread_wake.clone().into_waker();
             f(&*thread_wake, &waker, seqno)
         }
     })
@@ -47,9 +47,10 @@ pub fn thread_suspend<F, R>(f: F) -> R
 where
     F: FnMut(&mut Context) -> Poll<R>,
 {
-    match thread_suspend_deadline(f, None) {
-        Poll::Ready(result) => result,
-        Poll::Pending => unreachable!(),
+    if let Poll::Ready(result) = thread_suspend_deadline(f, None) {
+        result
+    } else {
+        unreachable!()
     }
 }
 
@@ -61,21 +62,30 @@ where
     with_thread_suspend(|thread_wake, waker, seqno| {
         let mut cx = Context::from_waker(waker);
         loop {
-            match f(&mut cx) {
-                Poll::Ready(result) => return Poll::Ready(result),
-                Poll::Pending => {
-                    while thread_wake.waiting(seqno) {
-                        if let Some(expire) = expire.as_ref() {
-                            if let Some(dur) = expire.checked_duration_since(Instant::now()) {
-                                thread::park_timeout(dur);
-                            } else {
-                                // free up instance for next caller
-                                thread_wake.release(seqno);
-                                return Poll::Pending;
-                            }
+            if let Poll::Ready(result) = f(&mut cx) {
+                break Poll::Ready(result);
+            } else {
+                if !thread_wake.waiting(seqno) {
+                    // waker was called directly by the polling function.
+                    // poll again immediately before going into wait loop
+                    if let Poll::Ready(result) = f(&mut cx) {
+                        break Poll::Ready(result);
+                    }
+                }
+                loop {
+                    if let Some(expire) = expire.as_ref() {
+                        if let Some(dur) = expire.checked_duration_since(Instant::now()) {
+                            thread::park_timeout(dur);
                         } else {
-                            thread::park();
+                            // free up instance for next caller
+                            thread_wake.release(seqno);
+                            return Poll::Pending;
                         }
+                    } else {
+                        thread::park();
+                    }
+                    if !thread_wake.waiting(seqno) {
+                        break;
                     }
                 }
             }
@@ -96,7 +106,7 @@ impl ThreadWake {
         Self::waker_drop,
     );
 
-    fn new(seqno: usize, thread: Thread) -> Self {
+    const fn new(seqno: usize, thread: Thread) -> Self {
         Self {
             seqno: AtomicUsize::new(seqno),
             thread,
@@ -118,8 +128,9 @@ impl ThreadWake {
         self.seqno.compare_and_swap(seqno, 0, Ordering::Release) == seqno
     }
 
-    fn waker(self: &Arc<Self>) -> Waker {
-        let data = Arc::into_raw(self.clone()) as *const ();
+    #[inline]
+    fn into_waker(self: Arc<Self>) -> Waker {
+        let data = Arc::into_raw(self) as *const ();
         unsafe { Waker::from_raw(RawWaker::new(data, &Self::WAKER_VTABLE)) }
     }
 
@@ -139,7 +150,7 @@ impl ThreadWake {
     }
 
     unsafe fn waker_wake_by_ref(data: *const ()) {
-        // if this instance is avaliable to be woken by reference, then the
+        // if this instance is available to be woken by reference, then the
         // sequence number is either seqno or 0, we don't need to worry about
         // comparing and swapping it
         (&*(data as *const Self)).seqno.store(0, Ordering::Release);
@@ -170,8 +181,8 @@ impl ThreadWakeRef {
     }
 
     unsafe fn waker_clone(data: *const ()) -> RawWaker {
-        let slf = ManuallyDrop::new(Box::from_raw(data as *mut Self));
-        (&*slf).clone().into_raw_waker()
+        let slf = &*(data as *const Self);
+        Box::new(slf.clone()).into_raw_waker()
     }
 
     unsafe fn waker_wake(data: *const ()) {
