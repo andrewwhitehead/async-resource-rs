@@ -8,33 +8,19 @@ use std::sync::{
     Arc,
 };
 use std::task::{Context, Poll, Waker};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use pin_utils::pin_mut;
 
-use super::waker::{waker_from, waker_ref, ArcWake, WakerRef, THREAD_WAKER};
+use super::thread::thread_suspend_deadline;
+use super::waker::{waker_from, waker_ref, ArcWake, WakerRef};
 
-const IDLE: u8 = 0x0;
-const WAIT: u8 = 0x1;
-const LISTEN: u8 = 0x2;
-const CLOSED: u8 = 0x3;
-
-pub(crate) enum ClearResult {
-    Removed(Waker),
-    NoChange,
-    Updated(u8),
-}
-
-impl ClearResult {
-    pub fn is_removed(&self) -> bool {
-        matches!(self, Self::Removed(_))
-    }
-
-    pub fn is_updated(&self) -> bool {
-        matches!(self, Self::Updated(_) | Self::Removed(_))
-    }
-}
+const IDLE: u8 = 0b000;
+const WAIT: u8 = 0b001;
+const LISTEN: u8 = 0b011;
+const PREPARE: u8 = 0b100;
+const PREPARE_WAIT: u8 = 0b101;
+const PREPARE_LISTEN: u8 = 0b111;
 
 pub(crate) struct InnerSuspend {
     state: AtomicU8,
@@ -53,42 +39,58 @@ impl InnerSuspend {
         Self::new(WAIT)
     }
 
+    // #[inline]
     pub fn acquire(&self) -> bool {
-        if self.state.compare_and_swap(IDLE, WAIT, Ordering::AcqRel) == IDLE {
+        self.state.compare_and_swap(IDLE, WAIT, Ordering::AcqRel) == IDLE
+    }
+
+    pub fn clear_waiting(&self) -> bool {
+        let prev = self.state.fetch_and(!LISTEN, Ordering::Release);
+        match prev & LISTEN {
+            IDLE => false,
+            WAIT => true,
+            LISTEN => {
+                unsafe { self.vacate_waker() };
+                true
+            }
+            _ => panic!("Invalid state"),
+        }
+    }
+
+    pub fn try_clear_waiting(&self) -> bool {
+        // used to guarantee delivery in one-shot.
+        // needs to do nothing and return false if the PREPARE flag is set
+        let state = self.state();
+        if state == IDLE {
+            true
+        } else if (state == WAIT || state == LISTEN)
+            && self.state.compare_and_swap(state, IDLE, Ordering::Release) == state
+        {
+            if state == LISTEN {
+                unsafe { self.vacate_waker() };
+            }
             true
         } else {
             false
         }
     }
 
-    fn clear(&self, newval: u8) -> ClearResult {
-        match self.state.swap(newval, Ordering::Release) {
-            LISTEN => ClearResult::Removed(unsafe { self.vacate_waker() }),
-            state => {
-                if state == newval {
-                    ClearResult::NoChange
-                } else {
-                    ClearResult::Updated(state)
-                }
-            }
-        }
+    // #[inline]
+    pub fn is_idle(&self) -> bool {
+        self.state() == IDLE
     }
 
-    pub fn close(&self) -> ClearResult {
-        self.clear(CLOSED)
-    }
-
+    // #[inline]
     pub fn is_waiting(&self) -> bool {
-        let s = self.state();
-        s == WAIT || s == LISTEN
+        self.state() & LISTEN != IDLE
     }
 
     /// Try to start listening with a new waker
-    pub fn listen(&self, waker: &Waker) -> bool {
+    pub fn poll(&self, cx: &mut Context) -> Poll<()> {
         match self.state() {
-            IDLE | CLOSED => {
+            IDLE | PREPARE => {
                 // not currently acquired
-                return false;
+                return Poll::Ready(());
             }
             WAIT => (),
             LISTEN => {
@@ -101,9 +103,7 @@ impl InnerSuspend {
                         Ordering::Acquire,
                     ) {
                         Ok(_) => {
-                            break unsafe {
-                                self.vacate_waker();
-                            }
+                            break drop(unsafe { self.vacate_waker() });
                         }
                         Err(WAIT) => {
                             // competition from another thread?
@@ -113,29 +113,56 @@ impl InnerSuspend {
                         Err(LISTEN) => {
                             // retry
                         }
-                        Err(IDLE) | Err(CLOSED) => {
-                            // already notified
-                            return false;
+                        Err(IDLE) | Err(PREPARE) => {
+                            // already notified, or being notified
+                            return Poll::Ready(());
                         }
                         Err(_) => panic!("Invalid state"),
                     }
                 }
             }
+            PREPARE_WAIT | PREPARE_LISTEN => {
+                // about to be notified. call the new waker to poll again immediately
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             _ => panic!("Invalid state"),
         }
+
+        // must be in the WAIT state at this point, or PREPARE_WAIT if pre-empted
+        // by prepare_notify()
         unsafe {
-            self.update_waker(waker.clone());
+            self.update_waker(cx.waker().clone());
         }
+
         match self.state.compare_and_swap(WAIT, LISTEN, Ordering::AcqRel) {
-            WAIT => true,
+            WAIT => {
+                // registered listener
+                Poll::Pending
+            }
             IDLE => {
-                // notify was called while storing
-                unsafe {
-                    self.vacate_waker();
-                }
+                // notify() was called while storing
+                drop(unsafe { self.vacate_waker() });
+                Poll::Ready(())
+            }
+            PREPARE_WAIT => {
+                // prepare_notify() was called while storing. call new the waker now,
+                // so the listener will poll again for the result
+                unsafe { self.vacate_waker() }.wake();
+                Poll::Pending
+            }
+            _ => panic!("Invalid state"),
+        }
+    }
+
+    // #[inline]
+    pub fn prepare_notify(&self) -> bool {
+        match self.state.fetch_or(PREPARE, Ordering::Release) {
+            IDLE => {
+                self.state.store(IDLE, Ordering::Release);
                 false
             }
-            CLOSED => false,
+            WAIT | LISTEN => true,
             _ => panic!("Invalid state"),
         }
     }
@@ -143,47 +170,18 @@ impl InnerSuspend {
     /// Clear the state if it is waiting, and call the notifier if any.
     /// Returns true if there was an active listener.
     pub fn notify(&self) -> bool {
-        match self.set_idle() {
-            ClearResult::Removed(waker) => {
-                waker.wake();
+        match self.state.swap(IDLE, Ordering::Release) {
+            IDLE | PREPARE => false,
+            WAIT | PREPARE_WAIT => true,
+            LISTEN | PREPARE_LISTEN => {
+                unsafe { self.vacate_waker() }.wake();
                 true
             }
-            ClearResult::Updated(_) => true,
-            ClearResult::NoChange => false,
+            _ => panic!("Invalid state"),
         }
     }
 
-    pub fn poll(&self, cx: &mut Context) -> Poll<()> {
-        match self.state() {
-            IDLE | CLOSED => {
-                return Poll::Ready(());
-            }
-            LISTEN => {
-                // try to clear existing waker and move back to wait state
-                if !self.set_waiting().is_removed() {
-                    // already taken (thread was pre-empted)
-                    return Poll::Ready(());
-                }
-            }
-            _ => (),
-        }
-
-        if self.listen(cx.waker()) {
-            Poll::Pending
-        } else {
-            // already notified
-            Poll::Ready(())
-        }
-    }
-
-    pub fn set_idle(&self) -> ClearResult {
-        self.clear(IDLE)
-    }
-
-    pub fn set_waiting(&self) -> ClearResult {
-        self.clear(WAIT)
-    }
-
+    // #[inline]
     pub fn state(&self) -> u8 {
         self.state.load(Ordering::Acquire)
     }
@@ -197,40 +195,34 @@ impl InnerSuspend {
     }
 
     pub fn wait(&self) {
-        if !THREAD_WAKER.with(|waker| self.listen(waker)) {
-            // already notified
-            return;
-        }
-        loop {
-            thread::park();
-            let s = self.state();
-            if s == IDLE || s == CLOSED {
-                break;
-            }
-        }
+        self.wait_deadline(None);
     }
 
-    pub fn wait_deadline(&self, expire: Instant) -> bool {
-        if !THREAD_WAKER.with(|waker| self.listen(waker)) {
-            // already notified
-            return true;
-        }
-        while let Some(dur) = expire.checked_duration_since(Instant::now()) {
-            thread::park_timeout(dur);
-            let s = self.state();
-            if s == IDLE || s == CLOSED {
-                // notified
-                return true;
-            }
-        }
-        // timer expired
-        false
+    pub fn wait_deadline(&self, expire: Option<Instant>) -> bool {
+        let mut first = true;
+        thread_suspend_deadline(
+            |cx| {
+                if first {
+                    first = false;
+                    self.poll(cx)
+                } else {
+                    // no need to update the waker after the first poll
+                    if self.is_idle() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }
+            },
+            expire,
+        )
+        .is_ready()
     }
 
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
         Instant::now()
             .checked_add(timeout)
-            .map(|expire| self.wait_deadline(expire))
+            .map(|expire| self.wait_deadline(Some(expire)))
             .unwrap_or(false)
     }
 
@@ -248,7 +240,7 @@ impl ArcWake for InnerSuspend {
 impl Drop for InnerSuspend {
     fn drop(&mut self) {
         // vacate any registered listener
-        self.set_idle();
+        self.clear_waiting();
     }
 }
 
@@ -435,7 +427,7 @@ impl Listener<'_> {
     /// reached. If a timeout occurs then `false` is returned, otherwise
     /// `true`.
     pub fn wait_deadline(self, expire: Instant) -> Result<(), Self> {
-        if self.inner.wait_deadline(expire) {
+        if self.inner.wait_deadline(Some(expire)) {
             Ok(())
         } else {
             Err(self)
@@ -475,7 +467,7 @@ impl Debug for Listener<'_> {
 
 impl Drop for Listener<'_> {
     fn drop(&mut self) {
-        self.inner.set_idle();
+        self.inner.clear_waiting();
     }
 }
 

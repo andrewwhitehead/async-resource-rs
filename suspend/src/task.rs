@@ -19,7 +19,7 @@ pub use super::oneshot::TaskSender;
 pub type PollFn<'a, T> = Box<dyn FnMut(&mut Context) -> Poll<T> + Send + 'a>;
 
 /// A boxed `CancelFuture`.
-pub type BoxCancelFuture<'a, T> = Pin<Box<dyn CancelFuture<T> + Send + 'a>>;
+pub type BoxCancelFuture<'a, T> = Pin<Box<dyn CancelFuture<Output = T> + Send + 'a>>;
 
 /// A boxed `FusedFuture`.
 pub type BoxFusedFuture<'a, T> = Pin<Box<dyn FusedFuture<Output = T> + Send + 'a>>;
@@ -48,7 +48,7 @@ pub fn ready<'t, T: Send + 't>(result: T) -> Task<'t, T> {
 
 /// A trait allowing for [`Task`] implementations with guaranteed delivery
 /// or non-delivery of the result.
-pub trait CancelFuture<T>: Future<Output = T> {
+pub trait CancelFuture: Future {
     /// Indicate that the consumer of the `Future` is going away. The return
     /// value should be `true` if a subsequent poll operation is guaranteed
     /// to return a `Ready` value.
@@ -60,6 +60,11 @@ pub trait CancelFuture<T>: Future<Output = T> {
     /// `true` if polling should no longer be attempted.
     fn is_terminated(&self) -> bool {
         false
+    }
+
+    /// If supported, poll the Future without a Waker.
+    fn try_poll(self: Pin<&mut Self>) -> Poll<Self::Output> {
+        Poll::Pending
     }
 }
 
@@ -105,13 +110,25 @@ impl<'t, T> TaskState<'t, T> {
         })
     }
 
+    fn try_poll_state(&mut self) -> Poll<T> {
+        match self {
+            Self::CancelFuture(fut) => fut.as_mut().try_poll(),
+            Self::Receiver(recv) => recv.try_recv(),
+            _ => return Poll::Pending,
+        }
+        .map(|r| {
+            *self = Self::Terminated;
+            r
+        })
+    }
+
     pub fn wait(self) -> T {
         match self {
             Self::CancelFuture(fut) => block_on(fut),
             Self::FusedFuture(fut) => block_on(fut),
             Self::Future(fut) => block_on(fut),
             Self::Poll(poll_fn) => thread_suspend(poll_fn),
-            Self::Receiver(mut recv) => recv.wait(),
+            Self::Receiver(recv) => recv.wait(),
             Self::Terminated => panic!("Cannot block on terminated task"),
         }
     }
@@ -129,9 +146,9 @@ impl<'t, T> TaskState<'t, T> {
                 Poll::Ready(r) => Ok(r),
                 Poll::Pending => Err(Self::Poll(poll_fn)),
             },
-            Self::Receiver(mut recv) => {
-                recv.wait_deadline(expire).map_err(|_| Self::Receiver(recv))
-            }
+            Self::Receiver(recv) => recv
+                .wait_deadline(expire)
+                .map_err(|recv| Self::Receiver(recv)),
             Self::Terminated => Err(self),
         }
     }
@@ -157,7 +174,7 @@ impl<'t, T> Task<'t, T> {
     /// already boxed, then it would be more efficient to use `Task::from`.
     pub fn from_cancel_fut<C>(task: C) -> Self
     where
-        C: CancelFuture<T> + Send + 't,
+        C: CancelFuture<Output = T> + Send + 't,
     {
         Self::from(Box::pin(task) as BoxCancelFuture<'t, T>)
     }
@@ -347,5 +364,19 @@ impl<'t, T> Future for Task<'t, T> {
 impl<'t, T> FusedFuture for Task<'t, T> {
     fn is_terminated(&self) -> bool {
         self.state.is_terminated()
+    }
+}
+
+impl<'t, T> CancelFuture for Task<'t, T> {
+    fn cancel(mut self: Pin<&mut Self>) -> bool {
+        self.state.cancel()
+    }
+
+    fn is_terminated(&self) -> bool {
+        self.state.is_terminated()
+    }
+
+    fn try_poll(mut self: Pin<&mut Self>) -> Poll<T> {
+        self.state.try_poll_state()
     }
 }

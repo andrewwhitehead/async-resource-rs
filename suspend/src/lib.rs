@@ -45,14 +45,13 @@
 //! let notifier = susp.notifier();
 //!
 //! // start listening for notifications
-//! let mut listener = susp.listen();
+//! let listener = susp.listen();
 //! // send a notification (satisfies the current listener)
 //! notifier.notify();
 //! // wait for notification (already sent) with a timeout
-//! assert_eq!(listener.wait_timeout(Duration::from_secs(1)), true);
-//! drop(listener);
+//! assert!(listener.wait_timeout(Duration::from_secs(1)).is_ok());
 //!
-//! let mut listener = susp.listen();
+//! let listener = susp.listen();
 //! notifier.notify();
 //! // the listener is also a Future
 //! suspend::block_on(async { listener.await });
