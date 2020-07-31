@@ -157,7 +157,7 @@ fn channel_test_future() {
 #[test]
 fn channel_test_cancel_early() {
     let (sender, mut receiver) = message_task::<u32>();
-    assert!(receiver.cancel());
+    assert!(receiver.try_cancel());
     assert_eq!(receiver.wait(), Err(Incomplete));
     assert!(sender.send(5).is_err());
 }

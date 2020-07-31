@@ -183,12 +183,12 @@ unsafe impl<T: Send> Send for TaskReceiver<T> {}
 unsafe impl<T: Send> Sync for TaskReceiver<T> {}
 
 impl<T> TaskReceiver<T> {
-    pub fn cancel(&mut self) -> bool {
-        unsafe { &*self.channel }.try_cancel_recv()
-    }
-
     pub fn poll(&mut self, cx: &mut Context) -> Poll<T> {
         unsafe { &*self.channel }.poll(cx)
+    }
+
+    pub fn try_cancel(&mut self) -> bool {
+        unsafe { &*self.channel }.try_cancel_recv()
     }
 
     pub fn try_recv(&mut self) -> Poll<T> {

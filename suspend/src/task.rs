@@ -49,16 +49,16 @@ pub fn ready<'t, T: Send + 't>(result: T) -> Task<'t, T> {
 /// A trait allowing for [`Task`] implementations with guaranteed delivery
 /// or non-delivery of the result.
 pub trait CancelFuture: Future {
-    /// Indicate that the consumer of the `Future` is going away. The return
-    /// value should be `true` if a subsequent poll operation is guaranteed
-    /// to return a `Ready` value.
-    fn cancel(self: Pin<&mut Self>) -> bool {
-        false
-    }
-
     /// Equivalent to `FusedFuture::is_terminated`, this method must return
     /// `true` if polling should no longer be attempted.
     fn is_terminated(&self) -> bool {
+        false
+    }
+
+    /// Indicate that the consumer of the `Future` is going away. The return
+    /// value should be `true` if a subsequent poll operation is guaranteed
+    /// to return a `Ready` value.
+    fn try_cancel(self: Pin<&mut Self>) -> bool {
         false
     }
 
@@ -78,14 +78,6 @@ enum TaskState<'t, T> {
 }
 
 impl<'t, T> TaskState<'t, T> {
-    fn cancel(&mut self) -> bool {
-        match self {
-            Self::CancelFuture(fut) => fut.as_mut().cancel(),
-            Self::Receiver(recv) => recv.cancel(),
-            _ => false,
-        }
-    }
-
     fn is_terminated(&self) -> bool {
         match self {
             Self::CancelFuture(fut) => fut.is_terminated(),
@@ -110,7 +102,15 @@ impl<'t, T> TaskState<'t, T> {
         })
     }
 
-    fn try_poll_state(&mut self) -> Poll<T> {
+    fn try_cancel(&mut self) -> bool {
+        match self {
+            Self::CancelFuture(fut) => fut.as_mut().try_cancel(),
+            Self::Receiver(recv) => recv.try_cancel(),
+            _ => false,
+        }
+    }
+
+    fn try_poll(&mut self) -> Poll<T> {
         match self {
             Self::CancelFuture(fut) => fut.as_mut().try_poll(),
             Self::Receiver(recv) => recv.try_recv(),
@@ -222,14 +222,6 @@ impl<'t, T> Task<'t, T> {
         })
     }
 
-    /// In the case of a `CancelFuture` or `Receiver` implementation, this
-    /// method can be used to indicate to the sender that the Task will be
-    /// dropped. The next poll or wait on the `Task` should not block if
-    /// `true` is returned.
-    pub fn cancel(&mut self) -> bool {
-        self.state.cancel()
-    }
-
     /// Equivalent to `FusedFuture::is_terminated`, this method will return
     /// `true` if polling should no longer be attempted.
     pub fn is_terminated(&mut self) -> bool {
@@ -245,6 +237,14 @@ impl<'t, T> Task<'t, T> {
     {
         let mut state = self.state;
         Task::from_poll(move |cx| state.poll_state(cx).map(&f))
+    }
+
+    /// In the case of a `CancelFuture` or `Receiver` implementation, this
+    /// method can be used to indicate to the sender that the Task will be
+    /// dropped. The next poll or wait on the `Task` should not block if
+    /// `true` is returned.
+    pub fn try_cancel(&mut self) -> bool {
+        self.state.try_cancel()
     }
 
     /// Resolve the `Task` to its result, parking the current thread until
@@ -368,15 +368,15 @@ impl<'t, T> FusedFuture for Task<'t, T> {
 }
 
 impl<'t, T> CancelFuture for Task<'t, T> {
-    fn cancel(mut self: Pin<&mut Self>) -> bool {
-        self.state.cancel()
-    }
-
     fn is_terminated(&self) -> bool {
         self.state.is_terminated()
     }
 
+    fn try_cancel(mut self: Pin<&mut Self>) -> bool {
+        self.state.try_cancel()
+    }
+
     fn try_poll(mut self: Pin<&mut Self>) -> Poll<T> {
-        self.state.try_poll_state()
+        self.state.try_poll()
     }
 }
