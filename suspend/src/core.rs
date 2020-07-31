@@ -4,10 +4,11 @@ use std::future::Future;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
+    atomic::{spin_loop_hint, AtomicU8, Ordering},
     Arc,
 };
 use std::task::{Context, Poll, Waker};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use pin_utils::pin_mut;
@@ -18,9 +19,9 @@ use super::waker::{waker_from, waker_ref, ArcWake, WakerRef};
 const IDLE: u8 = 0b000;
 const WAIT: u8 = 0b001;
 const LISTEN: u8 = 0b011;
-const PREPARE: u8 = 0b100;
-const PREPARE_WAIT: u8 = 0b101;
-const PREPARE_LISTEN: u8 = 0b111;
+const LOCKED: u8 = 0b100;
+const LOCKED_WAIT: u8 = 0b101;
+const LOCKED_LISTEN: u8 = 0b111;
 
 pub(crate) struct InnerSuspend {
     state: AtomicU8,
@@ -57,27 +58,9 @@ impl InnerSuspend {
         }
     }
 
-    pub fn try_clear_waiting(&self) -> bool {
-        // used to guarantee delivery in one-shot.
-        // needs to do nothing and return false if the PREPARE flag is set
-        let state = self.state();
-        if state == IDLE {
-            true
-        } else if (state == WAIT || state == LISTEN)
-            && self.state.compare_and_swap(state, IDLE, Ordering::Release) == state
-        {
-            if state == LISTEN {
-                unsafe { self.vacate_waker() };
-            }
-            true
-        } else {
-            false
-        }
-    }
-
     // #[inline]
-    pub fn is_idle(&self) -> bool {
-        self.state() == IDLE
+    pub fn is_locked(&self) -> bool {
+        self.state() & LOCKED == LOCKED
     }
 
     // #[inline]
@@ -88,7 +71,7 @@ impl InnerSuspend {
     /// Try to start listening with a new waker
     pub fn poll(&self, cx: &mut Context) -> Poll<()> {
         match self.state() {
-            IDLE | PREPARE => {
+            IDLE | LOCKED => {
                 // not currently acquired
                 return Poll::Ready(());
             }
@@ -113,7 +96,7 @@ impl InnerSuspend {
                         Err(LISTEN) => {
                             // retry
                         }
-                        Err(IDLE) | Err(PREPARE) => {
+                        Err(IDLE) | Err(LOCKED) => {
                             // already notified, or being notified
                             return Poll::Ready(());
                         }
@@ -121,7 +104,7 @@ impl InnerSuspend {
                     }
                 }
             }
-            PREPARE_WAIT | PREPARE_LISTEN => {
+            LOCKED_WAIT | LOCKED_LISTEN => {
                 // about to be notified. call the new waker to poll again immediately
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
@@ -129,8 +112,8 @@ impl InnerSuspend {
             _ => panic!("Invalid state"),
         }
 
-        // must be in the WAIT state at this point, or PREPARE_WAIT if pre-empted
-        // by prepare_notify()
+        // must be in the WAIT state at this point, or LOCKED_WAIT if pre-empted
+        // by lock()
         unsafe {
             self.update_waker(cx.waker().clone());
         }
@@ -145,8 +128,8 @@ impl InnerSuspend {
                 drop(unsafe { self.vacate_waker() });
                 Poll::Ready(())
             }
-            PREPARE_WAIT => {
-                // prepare_notify() was called while storing. call new the waker now,
+            LOCKED_WAIT => {
+                // lock() was called while storing. call new the waker now,
                 // so the listener will poll again for the result
                 unsafe { self.vacate_waker() }.wake();
                 Poll::Pending
@@ -156,24 +139,86 @@ impl InnerSuspend {
     }
 
     // #[inline]
-    pub fn prepare_notify(&self) -> bool {
-        match self.state.fetch_or(PREPARE, Ordering::Release) {
-            IDLE => {
-                self.state.store(IDLE, Ordering::Release);
-                false
+    pub fn lock(&self) -> (bool, bool) {
+        let prev = self.state.fetch_or(LOCKED, Ordering::Release);
+        (prev & LOCKED == 0, prev & LISTEN != 0)
+    }
+
+    /// Clear the waiting state and set the LOCKED bit. This is used to
+    /// indicate when the listener is cancelling a notification, as in the
+    /// one-shot Task. Returns a pair of (acquired, cleared) where acquired
+    /// indicates that the LOCKED bit was not previously set, and cleared
+    /// indicates that the state was either WAIT or LISTEN.
+    pub fn lock_and_clear_waiting(&self) -> (bool, bool) {
+        let prev = self.state.swap(LOCKED, Ordering::Release);
+        let cleared = match prev & LISTEN {
+            IDLE => false,
+            WAIT => true,
+            LISTEN => {
+                unsafe { self.vacate_waker() };
+                true
             }
-            WAIT | LISTEN => true,
             _ => panic!("Invalid state"),
+        };
+        (prev & LOCKED == 0, cleared)
+    }
+
+    /// Clear the state if it is waiting, and call the notifier if any.
+    /// Returns a pair of (held, notified) where held indicates that the
+    /// lock was still held when the notify occurred.
+    pub fn locked_notify(&self) -> (bool, bool) {
+        let prev = self.state.swap(IDLE, Ordering::Release);
+        (
+            prev & LOCKED == LOCKED,
+            match prev & LISTEN {
+                IDLE => false,
+                WAIT => true,
+                LISTEN => {
+                    unsafe { self.vacate_waker() }.wake();
+                    true
+                }
+                _ => panic!("Invalid state"),
+            },
+        )
+    }
+
+    pub fn unlock(&self) -> bool {
+        self.state.fetch_and(!LOCKED, Ordering::Release) & LOCKED == LOCKED
+    }
+
+    pub fn unlock_and_clear_waiting(&self) -> bool {
+        match self.state.swap(IDLE, Ordering::Release) {
+            IDLE => false,
+            LISTEN | LOCKED_LISTEN => {
+                unsafe { self.vacate_waker() };
+                true
+            }
+            _ => true,
+        }
+    }
+
+    pub fn wait_unlock(&self) {
+        loop {
+            if !self.is_locked() {
+                return;
+            }
+            for _ in 0..100 {
+                spin_loop_hint();
+                if !self.is_locked() {
+                    return;
+                }
+            }
+            thread::yield_now();
         }
     }
 
     /// Clear the state if it is waiting, and call the notifier if any.
     /// Returns true if there was an active listener.
     pub fn notify(&self) -> bool {
-        match self.state.swap(IDLE, Ordering::Release) {
-            IDLE | PREPARE => false,
-            WAIT | PREPARE_WAIT => true,
-            LISTEN | PREPARE_LISTEN => {
+        match self.state.swap(IDLE, Ordering::Release) & LISTEN {
+            IDLE => false,
+            WAIT => true,
+            LISTEN => {
                 unsafe { self.vacate_waker() }.wake();
                 true
             }
@@ -207,7 +252,7 @@ impl InnerSuspend {
                     self.poll(cx)
                 } else {
                     // no need to update the waker after the first poll
-                    if self.is_idle() {
+                    if self.state() & LISTEN == IDLE {
                         Poll::Ready(())
                     } else {
                         Poll::Pending

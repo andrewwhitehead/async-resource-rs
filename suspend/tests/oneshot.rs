@@ -153,3 +153,11 @@ fn channel_test_future() {
     sender.send(5).unwrap();
     assert_eq!(block_on(receiver), Ok(5));
 }
+
+#[test]
+fn channel_test_cancel_early() {
+    let (sender, mut receiver) = message_task::<u32>();
+    assert!(receiver.cancel());
+    assert_eq!(receiver.wait(), Err(Incomplete));
+    assert!(sender.send(5).is_err());
+}

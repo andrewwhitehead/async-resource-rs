@@ -19,16 +19,35 @@ impl<T> Channel<T> {
         }
     }
 
+    // return value indicates whether the channel should be dropped
     pub fn cancel_recv(&self) -> bool {
-        self.state.clear_waiting()
+        !self.state.unlock_and_clear_waiting()
     }
 
+    // return value indicates whether a result value is ready to be provided
     pub fn try_cancel_recv(&self) -> bool {
-        self.state.try_clear_waiting() && unsafe { &*self.data.get() }.is_some()
+        match self.state.lock_and_clear_waiting() {
+            (_, false) => {
+                // the state was LOCKED or IDLE, meaning the send has completed
+                true
+            }
+            (false, true) => {
+                // the state was LOCKED | (WAIT or LISTEN), meaning the sender
+                // was pre-empted while updating the value. the receiver must
+                // spin until the update is completed
+                self.state.wait_unlock();
+                true
+            }
+            (true, true) => {
+                // successfully cancelled, check if there is a value
+                unsafe { &*self.data.get() }.is_some()
+            }
+        }
     }
 
+    // return value indicates whether the channel should be dropped
     pub fn cancel_send(&self) -> bool {
-        self.state.notify()
+        self.state.locked_notify() == (false, false)
     }
 
     pub fn is_waiting(&self) -> bool {
@@ -45,20 +64,38 @@ impl<T> Channel<T> {
         Poll::Pending
     }
 
-    pub fn send(&self, value: T) -> Result<(), T> {
-        if self.state.prepare_notify() {
-            unsafe {
-                self.data.get().replace(Some(value));
+    pub fn send(&self, value: T) -> Result<(), (bool, T)> {
+        match self.state.lock() {
+            (true, true) => {
+                // acquired lock, receiver still waiting
+                unsafe {
+                    self.data.get().replace(Some(value));
+                }
+                match self.state.locked_notify() {
+                    (true, _) => {
+                        // state was LOCKED | (WAIT or LISTEN): receiver has not cancelled or dropped.
+                        // state was LOCKED | IDLE: the receiver tried to cancel and saw the sender
+                        // was in the middle of writing the value, so it would spin until notified
+                        Ok(())
+                    }
+                    (false, false) => {
+                        // state was IDLE, receiver has been dropped
+                        Err((true, unsafe { self.take().unwrap() }))
+                    }
+                    (false, true) => panic!("Invalid state"),
+                }
             }
-            if self.state.notify() {
-                Ok(())
-            } else {
-                // receiver was dropped while sender was pre-empted
-                Err(unsafe { self.take().unwrap() })
+            (true, false) => {
+                // state was IDLE, receiver has been dropped
+                Err((true, value))
             }
-        } else {
-            // receiver must have been dropped already
-            Err(value)
+            (false, false) => {
+                // state was LOCKED | IDLE: the receiver has cancelled but not dropped.
+                // if unlock succeeds, then the receiver is responsible for dropping
+                // the channel, otherwise it has been dropped in the interim
+                Err((!self.state.unlock(), value))
+            }
+            (false, true) => panic!("Invalid state"),
         }
     }
 
@@ -68,13 +105,11 @@ impl<T> Channel<T> {
 
     pub fn try_recv(&self) -> Poll<T> {
         if !self.is_waiting() {
-            match unsafe { self.take() } {
-                Some(result) => Poll::Ready(result),
-                None => Poll::Pending,
+            if let Some(result) = unsafe { self.take() } {
+                return Poll::Ready(result);
             }
-        } else {
-            Poll::Pending
         }
+        Poll::Pending
     }
 
     pub fn wait(&self) -> T {
@@ -121,20 +156,20 @@ impl<T> TaskSender<T> {
     /// Dispatch the result and consume the `TaskSender`.
     pub fn send(self, value: T) -> Result<(), T> {
         let channel = mem::ManuallyDrop::new(self).channel;
-        // this allows the Arc<Channel> to be dropped normally despite
-        // drop() being skipped for self
-        unsafe { &*channel }.send(Ok(value)).map_err(|err| {
-            // receiver already dropped
-            drop(unsafe { Box::from_raw(channel) });
-            err.unwrap()
-        })
+        unsafe { &*channel }
+            .send(Ok(value))
+            .map_err(|(drop_channel, err)| {
+                if drop_channel {
+                    drop(unsafe { Box::from_raw(channel) });
+                }
+                err.unwrap()
+            })
     }
 }
 
 impl<T> Drop for TaskSender<T> {
     fn drop(&mut self) {
-        if !unsafe { &*self.channel }.cancel_send() {
-            // receiver already dropped
+        if unsafe { &*self.channel }.cancel_send() {
             drop(unsafe { Box::from_raw(self.channel) });
         }
     }
@@ -180,8 +215,7 @@ impl<T> TaskReceiver<T> {
 
 impl<T> Drop for TaskReceiver<T> {
     fn drop(&mut self) {
-        if !unsafe { &*self.channel }.cancel_recv() {
-            // sender already dropped
+        if unsafe { &*self.channel }.cancel_recv() {
             drop(unsafe { Box::from_raw(self.channel) });
         }
     }
