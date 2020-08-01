@@ -2,36 +2,23 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::task::Waker;
 
-use suspend::{
-    local_waker,
-    waker::{waker_from, LocalWakerRef, Wake},
-};
+use suspend::waker::{waker_from, /*LocalWakerRef,*/ WakeByRef, Wakeable};
 
-use pin_utils::pin_mut;
+mod utils;
+use utils::TestDrop;
 
-struct TestWaker {
-    cloned: Arc<AtomicUsize>,
-    dropped: Arc<AtomicUsize>,
+struct TestWaker<T> {
+    value: T,
     woken: Arc<AtomicUsize>,
 }
 
-impl TestWaker {
-    fn new() -> Self {
+impl<T> TestWaker<T> {
+    fn new(value: T) -> Self {
         Self {
-            cloned: Arc::new(AtomicUsize::new(0)),
-            dropped: Arc::new(AtomicUsize::new(0)),
+            value,
             woken: Arc::new(AtomicUsize::new(0)),
         }
-    }
-
-    fn cloned(&self) -> usize {
-        self.cloned.load(Ordering::Acquire)
-    }
-
-    fn dropped(&self) -> usize {
-        self.dropped.load(Ordering::Acquire)
     }
 
     fn woken(&self) -> usize {
@@ -39,96 +26,91 @@ impl TestWaker {
     }
 }
 
-impl Wake for TestWaker {
+impl<T: Send + Sync> WakeByRef for TestWaker<T> {
     fn wake_by_ref(&self) {
         self.woken.fetch_add(1, Ordering::SeqCst);
     }
 }
 
-impl Clone for TestWaker {
+impl<T: Clone> Clone for TestWaker<T> {
     fn clone(&self) -> Self {
-        self.cloned.fetch_add(1, Ordering::SeqCst);
         Self {
-            cloned: self.cloned.clone(),
-            dropped: self.dropped.clone(),
+            value: self.value.clone(),
             woken: self.woken.clone(),
         }
     }
 }
 
-impl Drop for TestWaker {
-    fn drop(&mut self) {
-        self.dropped.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
 #[test]
-fn test_create_and_wake() {
-    let first = TestWaker::new();
-    let waker = waker_from(first.clone());
-    assert_eq!(first.cloned(), 1);
-    assert_eq!(first.dropped(), 0);
-    assert_eq!(first.woken(), 0);
+fn waker_from_create_and_wake() {
+    let (track, drops) = TestDrop::new_pair();
+    let source = TestWaker::new(track);
+    let waker = waker_from(source.clone());
+    assert_eq!(drops.count(), 0);
+    assert_eq!(source.woken(), 0);
     waker.wake();
-    assert_eq!(first.cloned(), 1);
-    assert_eq!(first.dropped(), 1);
-    assert_eq!(first.woken(), 1);
+    assert_eq!(drops.count(), 1);
+    assert_eq!(source.woken(), 1);
 }
 
 #[test]
-fn test_local_wake_by_ref() {
-    let first = TestWaker::new();
-    pin_mut!(first);
-    let waker = LocalWakerRef::new(first.as_mut());
-    assert_eq!(first.cloned(), 0);
-    assert_eq!(first.dropped(), 0);
-    assert_eq!(first.woken(), 0);
-    Waker::wake_by_ref(&*waker);
-    assert_eq!(first.cloned(), 0);
-    assert_eq!(first.dropped(), 0);
-    assert_eq!(first.woken(), 1);
+fn waker_from_create_and_drop() {
+    let (track, drops) = TestDrop::new_pair();
+    let source = TestWaker::new(track);
+    let waker = waker_from(source.clone());
+    assert_eq!(drops.count(), 0);
+    assert_eq!(source.woken(), 0);
     drop(waker);
-    assert_eq!(first.cloned(), 0);
-    assert_eq!(first.dropped(), 0);
-    assert_eq!(first.woken(), 1);
+    assert_eq!(drops.count(), 1);
+    assert_eq!(source.woken(), 0);
 }
 
 #[test]
-fn test_local_create_wake() {
-    let first = TestWaker::new();
-    pin_mut!(first);
-    let waker = LocalWakerRef::new(first.as_mut());
-    assert_eq!(first.cloned(), 0);
-    assert_eq!(first.dropped(), 0);
-    assert_eq!(first.woken(), 0);
-    let w = waker.clone();
-    assert_eq!(first.cloned(), 1);
-    assert_eq!(first.dropped(), 0);
-    assert_eq!(first.woken(), 0);
-    w.wake();
-    assert_eq!(first.cloned(), 1);
-    assert_eq!(first.dropped(), 1);
-    assert_eq!(first.woken(), 1);
+fn waker_from_clone_wake() {
+    let (track, drops) = TestDrop::new_pair();
+    let source = TestWaker::new(track);
+    let waker = waker_from(source.clone());
+    let waker2 = waker.clone();
+    waker.wake();
+    drop(waker2);
+    assert_eq!(drops.count(), 1);
+    assert_eq!(source.woken(), 1);
 }
 
 #[test]
-fn test_local_macro() {
-    let first = TestWaker::new();
-    let _ = {
-        local_waker!(waker, first.clone());
-        assert_eq!(first.cloned(), 1);
-        assert_eq!(first.dropped(), 0);
-        assert_eq!(first.woken(), 0);
-        let w = waker.clone();
-        assert_eq!(first.cloned(), 2);
-        assert_eq!(first.dropped(), 0);
-        assert_eq!(first.woken(), 0);
-        w.wake();
-        assert_eq!(first.cloned(), 2);
-        assert_eq!(first.dropped(), 1);
-        assert_eq!(first.woken(), 1);
-    };
-    assert_eq!(first.cloned(), 2);
-    assert_eq!(first.dropped(), 2);
-    assert_eq!(first.woken(), 1);
+fn wakeable_create_wake() {
+    let (track, drops) = TestDrop::new_pair();
+    let source = Wakeable::new(TestWaker::new(track));
+    let waker = waker_from(&source);
+    waker.wake();
+    assert_eq!(drops.count(), 0);
+    assert_eq!(source.woken(), 1);
+    drop(source);
+    assert_eq!(drops.count(), 1);
+}
+
+#[test]
+fn wakeable_create_wake_by_ref() {
+    let (track, drops) = TestDrop::new_pair();
+    let source = Wakeable::new(TestWaker::new(track));
+    let waker = waker_from(&source);
+    waker.wake_by_ref();
+    assert_eq!(drops.count(), 0);
+    assert_eq!(source.woken(), 1);
+    drop(source);
+    assert_eq!(drops.count(), 0);
+    drop(waker);
+    assert_eq!(drops.count(), 1);
+}
+
+#[test]
+fn wakeable_clone() {
+    let (track, drops) = TestDrop::new_pair();
+    let source = Wakeable::new(TestWaker::new(track));
+    let s2 = source.clone();
+    drop(s2);
+    assert_eq!(drops.count(), 0);
+    assert_eq!(source.woken(), 0);
+    drop(source);
+    assert_eq!(drops.count(), 1);
 }

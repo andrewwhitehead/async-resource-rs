@@ -1,18 +1,18 @@
-use std::cell::UnsafeCell;
 use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{spin_loop_hint, AtomicU8, AtomicUsize, Ordering};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::sync::atomic::{spin_loop_hint, AtomicU8, Ordering};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use pin_utils::pin_mut;
 
 use super::thread::thread_suspend_deadline;
+use super::waker::{internal::WakeableState, WakeByRef};
 
 const IDLE: u8 = 0b000;
 const WAIT: u8 = 0b001;
@@ -227,7 +227,7 @@ impl SuspendState {
 
     #[inline]
     pub fn state(&self) -> u8 {
-        self.state.load(Ordering::Acquire)
+        self.state.load(Ordering::Relaxed)
     }
 
     pub unsafe fn drop_waker(&mut self) {
@@ -282,87 +282,14 @@ impl Drop for SuspendState {
     }
 }
 
-pub(crate) struct InnerSharedSuspend {
-    value: UnsafeCell<SuspendState>,
-    waker: MaybeUninit<Waker>,
-    count: AtomicUsize,
-}
-
-impl InnerSharedSuspend {
-    const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        Self::clone_waker,
-        Self::wake_waker,
-        Self::wake_by_ref_waker,
-        Self::drop_waker,
-    );
-
-    fn new(value: SuspendState) -> NonNull<Self> {
-        unsafe {
-            let slf = Box::into_raw(Box::new(Self {
-                value: UnsafeCell::new(value),
-                waker: MaybeUninit::uninit(),
-                count: AtomicUsize::new(1),
-            }));
-            (&mut *slf).waker = MaybeUninit::new(Waker::from_raw(Self::raw_waker(slf)));
-            NonNull::new_unchecked(slf)
-        }
-    }
-
-    #[inline]
-    fn get(&self) -> &SuspendState {
-        unsafe { &*self.value.get() }
-    }
-
-    #[inline]
-    fn get_mut(&self) -> &mut SuspendState {
-        unsafe { &mut *self.value.get() }
-    }
-
-    #[inline]
-    const fn raw_waker(data: *const Self) -> RawWaker {
-        RawWaker::new(data as *const (), &Self::WAKER_VTABLE)
-    }
-
-    unsafe fn clone_waker(data: *const ()) -> RawWaker {
-        let inst = &mut *(data as *mut Self);
-        inst.inc_count();
-        Self::raw_waker(data as *const Self)
-    }
-
-    pub(crate) unsafe fn wake_waker(data: *const ()) {
-        let inst = &*(data as *const Self);
-        inst.get().notify();
-        inst.dec_count();
-    }
-
-    pub(crate) unsafe fn wake_by_ref_waker(data: *const ()) {
-        let inst = &*(data as *const Self);
-        inst.get().notify();
-    }
-
-    pub(crate) unsafe fn drop_waker(data: *const ()) {
-        let inst = &*(data as *const Self);
-        inst.dec_count();
-    }
-
-    #[inline]
-    pub fn inc_count(&self) {
-        self.count.fetch_add(1, Ordering::SeqCst);
-    }
-
-    #[inline]
-    pub fn dec_count(&self) -> bool {
-        self.count.fetch_sub(1, Ordering::SeqCst) == 1
-    }
-
-    #[inline]
-    pub fn waker(&self) -> &Waker {
-        unsafe { &*self.get().waker.as_ptr() }
+impl WakeByRef for SuspendState {
+    fn wake_by_ref(&self) {
+        self.notify();
     }
 }
 
 pub(crate) struct SharedSuspend {
-    ptr: NonNull<InnerSharedSuspend>,
+    ptr: NonNull<WakeableState<SuspendState>>,
 }
 
 unsafe impl Send for SharedSuspend {}
@@ -371,18 +298,18 @@ unsafe impl Sync for SharedSuspend {}
 impl SharedSuspend {
     pub fn new_idle() -> Self {
         Self {
-            ptr: InnerSharedSuspend::new(SuspendState::new_idle()),
+            ptr: WakeableState::new(SuspendState::new_idle()),
         }
     }
 
     pub fn new_waiting() -> Self {
         Self {
-            ptr: InnerSharedSuspend::new(SuspendState::new_waiting()),
+            ptr: WakeableState::new(SuspendState::new_waiting()),
         }
     }
 
     #[inline]
-    fn inner(&self) -> &InnerSharedSuspend {
+    fn inner(&self) -> &WakeableState<SuspendState> {
         unsafe { self.ptr.as_ref() }
     }
 
@@ -405,7 +332,7 @@ impl SharedSuspend {
 
 impl Clone for SharedSuspend {
     fn clone(&self) -> Self {
-        self.inner().inc_count();
+        WakeableState::inc_count(self.ptr.as_ptr());
         Self { ptr: self.ptr }
     }
 }
@@ -420,11 +347,7 @@ impl Deref for SharedSuspend {
 
 impl Drop for SharedSuspend {
     fn drop(&mut self) {
-        if self.inner().dec_count() {
-            unsafe {
-                ptr::drop_in_place(self.ptr.as_ptr());
-            }
-        }
+        WakeableState::dec_count(unsafe { self.ptr.as_mut() });
     }
 }
 

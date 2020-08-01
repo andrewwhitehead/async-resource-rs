@@ -1,13 +1,13 @@
 use std::task::Waker;
 use std::thread::{self, Thread};
 
-#[macro_use]
-mod local;
-pub use local::LocalWakerRef;
+// #[macro_use]
+// mod local;
+// pub use local::LocalWakerRef;
 
-mod internal;
+pub(crate) mod internal;
 
-pub use internal::{waker_from, waker_ref, ArcWake, Wake, WakerRef};
+pub use internal::{waker_from, waker_ref, ArcWake, WakeByRef, Wakeable, WakerRef};
 
 thread_local! {
     pub(crate) static THREAD_WAKER: Waker = thread_waker();
@@ -18,12 +18,22 @@ pub fn thread_waker() -> Waker {
     waker_from(thread::current())
 }
 
-impl Wake for Thread {
-    fn wake(self) {
-        self.unpark()
-    }
+// FIXME Wake for AtomicBool? boxed function?
 
+impl WakeByRef for Thread {
     fn wake_by_ref(&self) {
         self.unpark()
     }
+}
+
+struct WakerFn<F: Fn() + Send + Sync>(F);
+
+impl<F: Fn() + Send + Sync> WakeByRef for WakerFn<F> {
+    fn wake_by_ref(&self) {
+        (self.0)()
+    }
+}
+
+pub fn waker_fn<F: Fn() + Send + Sync>(f: F) -> Waker {
+    waker_from(WakerFn(f))
 }
