@@ -52,7 +52,7 @@ impl<T> Channel<T> {
     }
 
     pub fn is_waiting(&self) -> bool {
-        self.state.is_waiting()
+        !self.state.check_idle()
     }
 
     pub fn poll(&mut self, cx: &mut Context) -> Poll<T> {
@@ -105,7 +105,7 @@ impl<T> Channel<T> {
     }
 
     pub fn try_recv(&mut self) -> Poll<T> {
-        if !self.is_waiting() {
+        if self.state.check_idle() {
             if let Some(result) = unsafe { self.take() } {
                 return Poll::Ready(result);
             }
