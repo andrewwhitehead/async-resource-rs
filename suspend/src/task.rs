@@ -1,13 +1,12 @@
 use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures_core::future::{BoxFuture, FusedFuture};
 
-use super::core::{InnerSuspend, Notifier};
+use super::core::{Notifier, SharedSuspend};
 use super::error::Incomplete;
 use super::helpers::{block_on, block_on_deadline};
 use super::oneshot::{Channel, TaskReceiver};
@@ -36,9 +35,12 @@ pub fn message_task<'t, T: Send + 'static>() -> (TaskSender<T>, Task<'t, Result<
 /// Create a new single-use [`Notifier`] and a corresponding [`Task`]. Once
 /// notified, the Task will resolve to `()`.
 pub fn notify_once<'a>() -> (Notifier, Task<'a, ()>) {
-    let inner = Arc::new(InnerSuspend::new_waiting());
-    let notifier = Notifier::from(inner.clone());
-    (notifier, Task::from_poll(move |cx| inner.poll(cx)))
+    let shared = SharedSuspend::new_waiting();
+    let notifier = Notifier::from(shared.clone());
+    (
+        notifier,
+        Task::from_poll(move |cx| unsafe { shared.acquire_unchecked() }.poll(cx)),
+    )
 }
 
 /// A convenience method to create a new [`Task`] from a result value.

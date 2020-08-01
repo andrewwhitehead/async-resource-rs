@@ -1,31 +1,32 @@
 use std::cell::UnsafeCell;
 use std::mem;
+use std::ptr::NonNull;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use super::core::InnerSuspend;
+use super::core::SuspendState;
 use super::error::{Incomplete, TimedOut};
 
 pub(crate) struct Channel<T> {
     data: UnsafeCell<Option<T>>,
-    state: InnerSuspend,
+    state: SuspendState,
 }
 
 impl<T> Channel<T> {
     const fn new(value: Option<T>) -> Self {
         Self {
             data: UnsafeCell::new(value),
-            state: InnerSuspend::new_waiting(),
+            state: SuspendState::new_waiting(),
         }
     }
 
     // return value indicates whether the channel should be dropped
-    pub fn cancel_recv(&self) -> bool {
+    pub fn cancel_recv(&mut self) -> bool {
         !self.state.unlock_and_clear_waiting()
     }
 
     // return value indicates whether a result value is ready to be provided
-    pub fn try_cancel_recv(&self) -> bool {
+    pub fn try_cancel_recv(&mut self) -> bool {
         match self.state.lock_and_clear_waiting() {
             (_, false) => {
                 // the state was LOCKED or IDLE, meaning the send has completed
@@ -46,7 +47,7 @@ impl<T> Channel<T> {
     }
 
     // return value indicates whether the channel should be dropped
-    pub fn cancel_send(&self) -> bool {
+    pub fn cancel_send(&mut self) -> bool {
         self.state.locked_notify() == (false, false)
     }
 
@@ -54,7 +55,7 @@ impl<T> Channel<T> {
         self.state.is_waiting()
     }
 
-    pub fn poll(&self, cx: &mut Context) -> Poll<T> {
+    pub fn poll(&mut self, cx: &mut Context) -> Poll<T> {
         if let Poll::Ready(()) = self.state.poll(cx) {
             if let Some(result) = unsafe { self.take() } {
                 return Poll::Ready(result);
@@ -64,7 +65,7 @@ impl<T> Channel<T> {
         Poll::Pending
     }
 
-    pub fn send(&self, value: T) -> Result<(), (bool, T)> {
+    pub fn send(&mut self, value: T) -> Result<(), (bool, T)> {
         match self.state.lock() {
             (true, true) => {
                 // acquired lock, receiver still waiting
@@ -99,11 +100,11 @@ impl<T> Channel<T> {
         }
     }
 
-    pub unsafe fn take(&self) -> Option<T> {
+    pub unsafe fn take(&mut self) -> Option<T> {
         self.data.get().replace(None)
     }
 
-    pub fn try_recv(&self) -> Poll<T> {
+    pub fn try_recv(&mut self) -> Poll<T> {
         if !self.is_waiting() {
             if let Some(result) = unsafe { self.take() } {
                 return Poll::Ready(result);
@@ -112,13 +113,13 @@ impl<T> Channel<T> {
         Poll::Pending
     }
 
-    pub fn wait(&self) -> T {
+    pub fn wait(&mut self) -> T {
         self.state.wait();
         // must have been notified here
         unsafe { self.take() }.unwrap()
     }
 
-    pub fn wait_deadline(&self, expire: Instant) -> Result<T, TimedOut> {
+    pub fn wait_deadline(&mut self, expire: Instant) -> Result<T, TimedOut> {
         if self.state.wait_deadline(Some(expire)) {
             Ok(unsafe { self.take() }.unwrap())
         } else {
@@ -133,7 +134,9 @@ impl<T> Channel<T> {
 
 impl<T> Channel<Result<T, Incomplete>> {
     pub fn pair() -> (TaskSender<T>, TaskReceiver<Result<T, Incomplete>>) {
-        let channel = Box::into_raw(Box::new(Self::new(Some(Err(Incomplete)))));
+        let channel = unsafe {
+            NonNull::new_unchecked(Box::into_raw(Box::new(Self::new(Some(Err(Incomplete))))))
+        };
         (TaskSender { channel }, TaskReceiver { channel })
     }
 }
@@ -141,7 +144,7 @@ impl<T> Channel<Result<T, Incomplete>> {
 /// Created by [`message_task`](crate::task::message_task) and used to dispatch
 /// a single message to a receiving [`Task`](crate::task::Task).
 pub struct TaskSender<T> {
-    channel: *mut Channel<Result<T, Incomplete>>,
+    channel: NonNull<Channel<Result<T, Incomplete>>>,
 }
 
 unsafe impl<T: Send> Send for TaskSender<T> {}
@@ -150,17 +153,17 @@ unsafe impl<T: Send> Sync for TaskSender<T> {}
 impl<T> TaskSender<T> {
     /// Check if the receiver has already been dropped.
     pub fn is_canceled(&self) -> bool {
-        !unsafe { &*self.channel }.is_waiting()
+        unsafe { self.channel.as_ref() }.is_waiting()
     }
 
     /// Dispatch the result and consume the `TaskSender`.
     pub fn send(self, value: T) -> Result<(), T> {
-        let channel = mem::ManuallyDrop::new(self).channel;
-        unsafe { &*channel }
+        let mut channel = mem::ManuallyDrop::new(self).channel;
+        unsafe { channel.as_mut() }
             .send(Ok(value))
             .map_err(|(drop_channel, err)| {
                 if drop_channel {
-                    drop(unsafe { Box::from_raw(channel) });
+                    drop(unsafe { Box::from_raw(channel.as_ptr()) });
                 }
                 err.unwrap()
             })
@@ -169,14 +172,14 @@ impl<T> TaskSender<T> {
 
 impl<T> Drop for TaskSender<T> {
     fn drop(&mut self) {
-        if unsafe { &*self.channel }.cancel_send() {
-            drop(unsafe { Box::from_raw(self.channel) });
+        if unsafe { self.channel.as_mut() }.cancel_send() {
+            drop(unsafe { Box::from_raw(self.channel.as_ptr()) });
         }
     }
 }
 
 pub(crate) struct TaskReceiver<T> {
-    channel: *mut Channel<T>,
+    channel: NonNull<Channel<T>>,
 }
 
 unsafe impl<T: Send> Send for TaskReceiver<T> {}
@@ -184,28 +187,28 @@ unsafe impl<T: Send> Sync for TaskReceiver<T> {}
 
 impl<T> TaskReceiver<T> {
     pub fn poll(&mut self, cx: &mut Context) -> Poll<T> {
-        unsafe { &*self.channel }.poll(cx)
+        unsafe { self.channel.as_mut() }.poll(cx)
     }
 
     pub fn try_cancel(&mut self) -> bool {
-        unsafe { &*self.channel }.try_cancel_recv()
+        unsafe { self.channel.as_mut() }.try_cancel_recv()
     }
 
     pub fn try_recv(&mut self) -> Poll<T> {
-        unsafe { &*self.channel }.try_recv()
+        unsafe { self.channel.as_mut() }.try_recv()
     }
 
     pub fn wait(self) -> T {
         // receiver is always the last surviving in this case, so it drops the channel
-        let channel = unsafe { Box::from_raw(mem::ManuallyDrop::new(self).channel) };
+        let mut channel = unsafe { Box::from_raw(mem::ManuallyDrop::new(self).channel.as_ptr()) };
         channel.wait()
     }
 
-    pub fn wait_deadline(self, expire: Instant) -> Result<T, Self> {
-        match unsafe { &*self.channel }.wait_deadline(expire) {
+    pub fn wait_deadline(mut self, expire: Instant) -> Result<T, Self> {
+        match unsafe { self.channel.as_mut() }.wait_deadline(expire) {
             Ok(result) => {
                 let channel = mem::ManuallyDrop::new(self).channel;
-                drop(unsafe { Box::from_raw(channel) });
+                drop(unsafe { Box::from_raw(channel.as_ptr()) });
                 Ok(result)
             }
             Err(_) => Err(self),
@@ -215,8 +218,8 @@ impl<T> TaskReceiver<T> {
 
 impl<T> Drop for TaskReceiver<T> {
     fn drop(&mut self) {
-        if unsafe { &*self.channel }.cancel_recv() {
-            drop(unsafe { Box::from_raw(self.channel) });
+        if unsafe { self.channel.as_mut() }.cancel_recv() {
+            drop(unsafe { Box::from_raw(self.channel.as_ptr()) });
         }
     }
 }

@@ -2,19 +2,17 @@ use std::cell::UnsafeCell;
 use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::mem::MaybeUninit;
+use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::{
-    atomic::{spin_loop_hint, AtomicU8, Ordering},
-    Arc,
-};
-use std::task::{Context, Poll, Waker};
+use std::ptr::{self, NonNull};
+use std::sync::atomic::{spin_loop_hint, AtomicU8, AtomicUsize, Ordering};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use pin_utils::pin_mut;
 
 use super::thread::thread_suspend_deadline;
-use super::waker::{waker_from, waker_ref, ArcWake, WakerRef};
 
 const IDLE: u8 = 0b000;
 const WAIT: u8 = 0b001;
@@ -23,53 +21,55 @@ const LOCKED: u8 = 0b100;
 const LOCKED_WAIT: u8 = 0b101;
 const LOCKED_LISTEN: u8 = 0b111;
 
-pub(crate) struct InnerSuspend {
+pub(crate) struct SuspendState {
     state: AtomicU8,
-    waker: UnsafeCell<MaybeUninit<Waker>>,
+    waker: MaybeUninit<Waker>,
 }
 
-impl InnerSuspend {
+impl SuspendState {
+    #[inline]
     const fn new(state: u8) -> Self {
         Self {
             state: AtomicU8::new(state),
-            waker: UnsafeCell::new(MaybeUninit::uninit()),
+            waker: MaybeUninit::uninit(),
         }
+    }
+
+    pub const fn new_idle() -> Self {
+        Self::new(IDLE)
     }
 
     pub const fn new_waiting() -> Self {
         Self::new(WAIT)
     }
 
-    // #[inline]
-    pub fn acquire(&self) -> bool {
+    pub fn try_acquire(&self) -> bool {
         self.state.compare_and_swap(IDLE, WAIT, Ordering::AcqRel) == IDLE
     }
 
-    pub fn clear_waiting(&self) -> bool {
+    pub fn clear_waiting(&mut self) -> bool {
         let prev = self.state.fetch_and(!LISTEN, Ordering::Release);
         match prev & LISTEN {
             IDLE => false,
             WAIT => true,
             LISTEN => {
-                unsafe { self.vacate_waker() };
+                unsafe { self.drop_waker() };
                 true
             }
             _ => panic!("Invalid state"),
         }
     }
 
-    // #[inline]
     pub fn is_locked(&self) -> bool {
         self.state() & LOCKED == LOCKED
     }
 
-    // #[inline]
     pub fn is_waiting(&self) -> bool {
         self.state() & LISTEN != IDLE
     }
 
     /// Try to start listening with a new waker
-    pub fn poll(&self, cx: &mut Context) -> Poll<()> {
+    pub fn poll(&mut self, cx: &mut Context) -> Poll<()> {
         match self.state() {
             IDLE | LOCKED => {
                 // not currently acquired
@@ -86,7 +86,7 @@ impl InnerSuspend {
                         Ordering::Acquire,
                     ) {
                         Ok(_) => {
-                            break drop(unsafe { self.vacate_waker() });
+                            break unsafe { self.drop_waker() };
                         }
                         Err(WAIT) => {
                             // competition from another thread?
@@ -115,7 +115,7 @@ impl InnerSuspend {
         // must be in the WAIT state at this point, or LOCKED_WAIT if pre-empted
         // by lock()
         unsafe {
-            self.update_waker(cx.waker().clone());
+            self.store_waker(cx.waker().clone());
         }
 
         match self.state.compare_and_swap(WAIT, LISTEN, Ordering::AcqRel) {
@@ -125,21 +125,20 @@ impl InnerSuspend {
             }
             IDLE => {
                 // notify() was called while storing
-                drop(unsafe { self.vacate_waker() });
+                unsafe { self.drop_waker() };
                 Poll::Ready(())
             }
             LOCKED_WAIT => {
                 // lock() was called while storing. call new the waker now,
                 // so the listener will poll again for the result
-                unsafe { self.vacate_waker() }.wake();
+                unsafe { self.wake_waker() };
                 Poll::Pending
             }
             _ => panic!("Invalid state"),
         }
     }
 
-    // #[inline]
-    pub fn lock(&self) -> (bool, bool) {
+    pub fn lock(&mut self) -> (bool, bool) {
         let prev = self.state.fetch_or(LOCKED, Ordering::Release);
         (prev & LOCKED == 0, prev & LISTEN != 0)
     }
@@ -149,13 +148,13 @@ impl InnerSuspend {
     /// one-shot Task. Returns a pair of (acquired, cleared) where acquired
     /// indicates that the LOCKED bit was not previously set, and cleared
     /// indicates that the state was either WAIT or LISTEN.
-    pub fn lock_and_clear_waiting(&self) -> (bool, bool) {
+    pub fn lock_and_clear_waiting(&mut self) -> (bool, bool) {
         let prev = self.state.swap(LOCKED, Ordering::Release);
         let cleared = match prev & LISTEN {
             IDLE => false,
             WAIT => true,
             LISTEN => {
-                unsafe { self.vacate_waker() };
+                unsafe { self.drop_waker() };
                 true
             }
             _ => panic!("Invalid state"),
@@ -174,7 +173,7 @@ impl InnerSuspend {
                 IDLE => false,
                 WAIT => true,
                 LISTEN => {
-                    unsafe { self.vacate_waker() }.wake();
+                    unsafe { self.wake_waker() };
                     true
                 }
                 _ => panic!("Invalid state"),
@@ -182,15 +181,15 @@ impl InnerSuspend {
         )
     }
 
-    pub fn unlock(&self) -> bool {
+    pub fn unlock(&mut self) -> bool {
         self.state.fetch_and(!LOCKED, Ordering::Release) & LOCKED == LOCKED
     }
 
-    pub fn unlock_and_clear_waiting(&self) -> bool {
+    pub fn unlock_and_clear_waiting(&mut self) -> bool {
         match self.state.swap(IDLE, Ordering::Release) {
             IDLE => false,
             LISTEN | LOCKED_LISTEN => {
-                unsafe { self.vacate_waker() };
+                unsafe { self.drop_waker() };
                 true
             }
             _ => true,
@@ -219,31 +218,35 @@ impl InnerSuspend {
             IDLE => false,
             WAIT => true,
             LISTEN => {
-                unsafe { self.vacate_waker() }.wake();
+                unsafe { self.wake_waker() };
                 true
             }
             _ => panic!("Invalid state"),
         }
     }
 
-    // #[inline]
+    #[inline]
     pub fn state(&self) -> u8 {
         self.state.load(Ordering::Acquire)
     }
 
-    pub unsafe fn update_waker(&self, waker: Waker) {
-        self.waker.get().write(MaybeUninit::new(waker))
+    pub unsafe fn drop_waker(&mut self) {
+        ptr::drop_in_place(self.waker.as_mut_ptr());
     }
 
-    pub unsafe fn vacate_waker(&self) -> Waker {
-        self.waker.get().read().assume_init()
+    pub unsafe fn store_waker(&mut self, waker: Waker) {
+        self.waker.as_mut_ptr().write(waker)
     }
 
-    pub fn wait(&self) {
+    pub unsafe fn wake_waker(&self) {
+        ptr::read(&self.waker).assume_init().wake();
+    }
+
+    pub fn wait(&mut self) {
         self.wait_deadline(None);
     }
 
-    pub fn wait_deadline(&self, expire: Option<Instant>) -> bool {
+    pub fn wait_deadline(&mut self, expire: Option<Instant>) -> bool {
         let mut first = true;
         thread_suspend_deadline(
             |cx| {
@@ -264,37 +267,171 @@ impl InnerSuspend {
         .is_ready()
     }
 
-    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+    pub fn wait_timeout(&mut self, timeout: Duration) -> bool {
         Instant::now()
             .checked_add(timeout)
             .map(|expire| self.wait_deadline(Some(expire)))
             .unwrap_or(false)
     }
-
-    pub fn waker_ref<'a>(self: &'a Arc<Self>) -> WakerRef<'a> {
-        waker_ref(self)
-    }
 }
 
-impl ArcWake for InnerSuspend {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        arc_self.notify();
-    }
-}
-
-impl Drop for InnerSuspend {
+impl Drop for SuspendState {
     fn drop(&mut self) {
         // vacate any registered listener
         self.clear_waiting();
     }
 }
 
-unsafe impl Sync for InnerSuspend {}
+pub(crate) struct InnerSharedSuspend {
+    value: UnsafeCell<SuspendState>,
+    waker: MaybeUninit<Waker>,
+    count: AtomicUsize,
+}
+
+impl InnerSharedSuspend {
+    const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        Self::clone_waker,
+        Self::wake_waker,
+        Self::wake_by_ref_waker,
+        Self::drop_waker,
+    );
+
+    fn new(value: SuspendState) -> NonNull<Self> {
+        unsafe {
+            let slf = Box::into_raw(Box::new(Self {
+                value: UnsafeCell::new(value),
+                waker: MaybeUninit::uninit(),
+                count: AtomicUsize::new(1),
+            }));
+            (&mut *slf).waker = MaybeUninit::new(Waker::from_raw(Self::raw_waker(slf)));
+            NonNull::new_unchecked(slf)
+        }
+    }
+
+    #[inline]
+    fn get(&self) -> &SuspendState {
+        unsafe { &*self.value.get() }
+    }
+
+    #[inline]
+    fn get_mut(&self) -> &mut SuspendState {
+        unsafe { &mut *self.value.get() }
+    }
+
+    #[inline]
+    const fn raw_waker(data: *const Self) -> RawWaker {
+        RawWaker::new(data as *const (), &Self::WAKER_VTABLE)
+    }
+
+    unsafe fn clone_waker(data: *const ()) -> RawWaker {
+        let inst = &mut *(data as *mut Self);
+        inst.inc_count();
+        Self::raw_waker(data as *const Self)
+    }
+
+    pub(crate) unsafe fn wake_waker(data: *const ()) {
+        let inst = &*(data as *const Self);
+        inst.get().notify();
+        inst.dec_count();
+    }
+
+    pub(crate) unsafe fn wake_by_ref_waker(data: *const ()) {
+        let inst = &*(data as *const Self);
+        inst.get().notify();
+    }
+
+    pub(crate) unsafe fn drop_waker(data: *const ()) {
+        let inst = &*(data as *const Self);
+        inst.dec_count();
+    }
+
+    #[inline]
+    pub fn inc_count(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn dec_count(&self) -> bool {
+        self.count.fetch_sub(1, Ordering::SeqCst) == 1
+    }
+
+    #[inline]
+    pub fn waker(&self) -> &Waker {
+        unsafe { &*self.get().waker.as_ptr() }
+    }
+}
+
+pub(crate) struct SharedSuspend {
+    ptr: NonNull<InnerSharedSuspend>,
+}
+
+unsafe impl Send for SharedSuspend {}
+unsafe impl Sync for SharedSuspend {}
+
+impl SharedSuspend {
+    pub fn new_idle() -> Self {
+        Self {
+            ptr: InnerSharedSuspend::new(SuspendState::new_idle()),
+        }
+    }
+
+    pub fn new_waiting() -> Self {
+        Self {
+            ptr: InnerSharedSuspend::new(SuspendState::new_waiting()),
+        }
+    }
+
+    #[inline]
+    fn inner(&self) -> &InnerSharedSuspend {
+        unsafe { self.ptr.as_ref() }
+    }
+
+    pub unsafe fn acquire_unchecked(&self) -> &mut SuspendState {
+        self.inner().get_mut()
+    }
+
+    pub fn try_acquire(&self) -> Option<&mut SuspendState> {
+        if self.inner().get().try_acquire() {
+            Some(unsafe { self.acquire_unchecked() })
+        } else {
+            None
+        }
+    }
+
+    pub fn waker(&self) -> &Waker {
+        self.inner().waker()
+    }
+}
+
+impl Clone for SharedSuspend {
+    fn clone(&self) -> Self {
+        self.inner().inc_count();
+        Self { ptr: self.ptr }
+    }
+}
+
+impl Deref for SharedSuspend {
+    type Target = SuspendState;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner().get()
+    }
+}
+
+impl Drop for SharedSuspend {
+    fn drop(&mut self) {
+        if self.inner().dec_count() {
+            unsafe {
+                ptr::drop_in_place(self.ptr.as_ptr());
+            }
+        }
+    }
+}
 
 /// A structure which may be used to suspend a thread or `Future` pending a
 /// notification.
 pub struct Suspend {
-    inner: Arc<InnerSuspend>,
+    shared: SharedSuspend,
 }
 
 impl Suspend {
@@ -303,21 +440,21 @@ impl Suspend {
     /// to construct a [`Listener`].
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(InnerSuspend::new(IDLE)),
+            shared: SharedSuspend::new_idle(),
         }
     }
 
     /// Construct a new `Notifier` instance associated with this `Suspend`.
     pub fn notifier(&self) -> Notifier {
         Notifier {
-            inner: self.inner.clone(),
+            shared: self.shared.clone(),
         }
     }
 
     /// Directly notify the `Suspend` instance and call any
     /// currently-associated waker.
     pub fn notify(&self) {
-        self.inner.notify();
+        self.shared.notify();
     }
 
     /// Given a mutable reference to the `Suspend`, start listening for
@@ -350,11 +487,10 @@ impl Suspend {
     /// Try to construct a `Listener` and start listening for notifications
     /// when only a read-only reference to the `Suspend` is available.
     pub fn try_listen(&self) -> Option<Listener<'_>> {
-        if self.inner.acquire() {
-            Some(Listener { inner: &self.inner })
-        } else {
-            None
-        }
+        self.shared.try_acquire().map(|shared| Listener {
+            shared,
+            waker: self.shared.waker(),
+        })
     }
 
     /// Block on the result of a `Future`. When evaluating multiple `Future`s,
@@ -407,14 +543,14 @@ impl Suspend {
 
     /// Get a `WakerRef` associated with the `Suspend` instance.
     /// The resulting instance can be cloned to obtain an owned `Waker`.
-    pub fn waker_ref(&self) -> WakerRef {
-        self.inner.waker_ref()
+    pub fn waker(&self) -> &Waker {
+        self.shared.waker()
     }
 }
 
 impl Debug for Suspend {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let state = match self.inner.state() {
+        let state = match self.shared.state() {
             IDLE => "Idle",
             WAIT => "Waiting",
             LISTEN => "Listening",
@@ -434,13 +570,14 @@ impl Default for Suspend {
 /// [`Suspend::try_listen`]. It may be used to wait for a notification with
 /// `.await` or by parking the current thread.
 pub struct Listener<'a> {
-    inner: &'a Arc<InnerSuspend>,
+    shared: &'a mut SuspendState,
+    waker: &'a Waker,
 }
 
 impl Listener<'_> {
     /// Check if the listener has already been notified.
     pub fn is_notified(&self) -> bool {
-        self.inner.state() == IDLE
+        self.shared.state() == IDLE
     }
 
     /// Poll a `Future`, which will then notify this listener when ready.
@@ -448,8 +585,7 @@ impl Listener<'_> {
     where
         F: Future,
     {
-        let waker = self.inner.waker_ref();
-        let mut cx = Context::from_waker(&*waker);
+        let mut cx = Context::from_waker(self.waker);
         fut.poll(&mut cx)
     }
 
@@ -464,7 +600,7 @@ impl Listener<'_> {
     /// Wait for a notification on the associated `Suspend` instance, parking
     /// the current thread until that time.
     pub fn wait(self) {
-        self.inner.wait()
+        self.shared.wait()
     }
 
     /// Wait for a notification on the associated `Suspend` instance, parking
@@ -472,7 +608,7 @@ impl Listener<'_> {
     /// reached. If a timeout occurs then `false` is returned, otherwise
     /// `true`.
     pub fn wait_deadline(self, expire: Instant) -> Result<(), Self> {
-        if self.inner.wait_deadline(Some(expire)) {
+        if self.shared.wait_deadline(Some(expire)) {
             Ok(())
         } else {
             Err(self)
@@ -484,23 +620,23 @@ impl Listener<'_> {
     /// expires. If a timeout does occur then `false` is returned, otherwise
     /// `true`.
     pub fn wait_timeout(self, timeout: Duration) -> Result<(), Self> {
-        if self.inner.wait_timeout(timeout) {
+        if self.shared.wait_timeout(timeout) {
             Ok(())
         } else {
             Err(self)
         }
     }
 
-    /// Get a `WakerRef` associated with the `Listener`.
-    /// The resulting instance can be cloned to obtain an owned `Waker`.
-    pub fn waker_ref(&self) -> WakerRef {
-        self.inner.waker_ref()
-    }
+    // /// Get a `WakerRef` associated with the `Listener`.
+    // /// The resulting instance can be cloned to obtain an owned `Waker`.
+    // pub fn waker_ref(&self) -> WakerRef {
+    //     self.inner.waker_ref()
+    // }
 }
 
 impl Debug for Listener<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let state = match self.inner.state() {
+        let state = match self.shared.state() {
             IDLE => "Notified",
             WAIT => "Waiting",
             LISTEN => "Polled",
@@ -512,15 +648,15 @@ impl Debug for Listener<'_> {
 
 impl Drop for Listener<'_> {
     fn drop(&mut self) {
-        self.inner.clear_waiting();
+        self.shared.clear_waiting();
     }
 }
 
 impl Future for Listener<'_> {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner.poll(cx)
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.shared.poll(cx)
     }
 }
 
@@ -535,30 +671,30 @@ impl Eq for Listener<'_> {}
 /// An instance of a notifier for a [`Suspend`] instance. When notified, the
 /// associated thread or `Future` will be woken if currently suspended.
 pub struct Notifier {
-    inner: Arc<InnerSuspend>,
+    shared: SharedSuspend,
 }
 
 impl Notifier {
     /// Notify the associated [`Suspend`] instance, calling its currently
     /// associated waker, if any.
     pub fn notify(&self) {
-        self.inner.notify();
+        self.shared.notify();
     }
 
-    /// Convert this instance into a [`Waker`].
-    pub fn into_waker(self) -> Waker {
-        waker_from(self.inner)
+    /// Obtain a `Waker` corresponding to the associated [`Suspend`] instance.
+    pub fn waker(&self) -> &Waker {
+        self.shared.waker()
     }
 }
 
 impl Clone for Notifier {
     fn clone(&self) -> Self {
-        Self::from(self.inner.clone())
+        Self::from(self.shared.clone())
     }
 }
 
-impl From<Arc<InnerSuspend>> for Notifier {
-    fn from(inner: Arc<InnerSuspend>) -> Self {
-        Self { inner }
+impl From<SharedSuspend> for Notifier {
+    fn from(shared: SharedSuspend) -> Self {
+        Self { shared }
     }
 }
