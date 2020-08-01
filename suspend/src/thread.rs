@@ -12,7 +12,7 @@ thread_local! {
     static THREAD_SUSPEND: (Arc<ThreadWake>, Waker, Cell<usize>) = {
         let tw = Arc::new(ThreadWake::new(0, thread::current()));
         let waker = tw.clone().into_waker();
-        (tw, waker, Cell::new(0))
+        (tw, waker, Cell::new(1))
     };
 }
 
@@ -24,10 +24,8 @@ where
     THREAD_SUSPEND.with(|(thread_wake, waker, seqno_source)| {
         let seqno = {
             let mut seq = seqno_source.get().wrapping_add(1);
-            if seq == 0 {
-                // handle overflow - need non-zero seqno
-                seq += 1;
-            }
+            // handle overflow - need seqno > 1 because 0 and 1 are special values
+            seq = std::cmp::max(seq, 2);
             seqno_source.replace(seq);
             seq
         };
@@ -63,6 +61,7 @@ where
         let mut cx = Context::from_waker(waker);
         loop {
             if let Poll::Ready(result) = f(&mut cx) {
+                thread_wake.release();
                 break Poll::Ready(result);
             } else {
                 if !thread_wake.waiting(seqno) {
@@ -78,13 +77,13 @@ where
                             thread::park_timeout(dur);
                         } else {
                             // free up instance for next caller
-                            thread_wake.release(seqno);
+                            thread_wake.release();
                             return Poll::Pending;
                         }
                     } else {
                         thread::park();
                     }
-                    if !thread_wake.waiting(seqno) {
+                    if thread_wake.restart(seqno) {
                         break;
                     }
                 }
@@ -115,7 +114,16 @@ impl ThreadWake {
 
     #[inline]
     fn acquire(&self, seqno: usize) -> bool {
-        self.seqno.compare_and_swap(0, seqno, Ordering::Release) == 0
+        self.seqno
+            .compare_exchange(0, seqno, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    #[inline]
+    fn restart(&self, seqno: usize) -> bool {
+        self.seqno
+            .compare_exchange(1, seqno, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
     }
 
     #[inline]
@@ -124,8 +132,15 @@ impl ThreadWake {
     }
 
     #[inline]
-    fn release(&self, seqno: usize) -> bool {
-        self.seqno.compare_and_swap(seqno, 0, Ordering::Release) == seqno
+    fn notify(&self, seqno: usize) -> bool {
+        self.seqno
+            .compare_exchange(seqno, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    #[inline]
+    fn release(&self) {
+        self.seqno.store(0, Ordering::Release);
     }
 
     #[inline]
@@ -197,7 +212,7 @@ impl ThreadWakeRef {
             return;
         }
         if let Some(source) = slf.inst.upgrade() {
-            if source.release(slf.seqno) {
+            if source.notify(slf.seqno) {
                 source.thread.unpark();
             }
         }
