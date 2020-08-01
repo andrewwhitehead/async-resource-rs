@@ -251,7 +251,7 @@ impl<T> OptionLock<T> {
     /// # Return values
     ///
     /// On successful acquisition an `OptionGuard` is returned, representing an
-    /// exclusive, read/write lock on the contaned data.
+    /// exclusive, read/write lock on the Option.
     ///
     /// On failure, a `TryLockError` is returned representing the failure state.
     /// Acquisition can fail if the lock is held exclusively or by one or more

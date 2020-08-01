@@ -19,7 +19,7 @@ pub struct Inner<T> {
 }
 
 impl<T> Inner<T> {
-    pub fn new(info: ResourceInfo, res: Option<T>, state: u8) -> Self {
+    pub const fn new(info: ResourceInfo, res: Option<T>, state: u8) -> Self {
         Self {
             data: UnsafeCell::new((info, res)),
             state: AtomicU8::new(state),

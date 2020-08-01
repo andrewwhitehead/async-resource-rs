@@ -139,12 +139,13 @@ impl<T: Send, E> PoolInternal<T, E> {
             let remain_timers = timers.split_off(&(Instant::now(), 0));
             for ((inst, _), timer) in timers {
                 match timer {
-                    Timer::Drain(_) => {
-                        // Cancel drain (waiter is notified by dropping it)
+                    Timer::Drain(waiter) => {
+                        // Cancel drain
                         drain_count -= 1;
                         if drain_count == 0 {
                             inner.stop_drain();
                         }
+                        waiter.cancel();
                     }
                     Timer::Verify(res) => {
                         if let Some(mut guard) = res.try_lock() {
@@ -346,8 +347,8 @@ impl<T: Send, E> PoolInternal<T, E> {
             match self.manage.state.compare_exchange_weak(
                 state,
                 next_state,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::Release,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => {
                     self.shared.notify();
@@ -568,5 +569,3 @@ impl<T: Send, E> Future for PoolDrain<T, E> {
         }
     }
 }
-
-// FIXME test behaviour of cloned WaitResponder + close
