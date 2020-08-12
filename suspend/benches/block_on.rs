@@ -4,16 +4,16 @@ use std::task::{Context, Poll};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
-struct Repoll(bool);
+struct Repoll(usize);
 
 impl Future for Repoll {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.0 {
+        if self.0 == 0 {
             Poll::Ready(())
         } else {
-            self.0 = false;
+            self.0 -= 1;
             cx.waker().wake_by_ref();
             Poll::Pending
         }
@@ -21,7 +21,7 @@ impl Future for Repoll {
 }
 
 fn test_fut() -> Repoll {
-    Repoll(true) // change to true to test a wake_by_ref during polling
+    Repoll(1)
 }
 
 fn suspend_block_on(count: usize) {

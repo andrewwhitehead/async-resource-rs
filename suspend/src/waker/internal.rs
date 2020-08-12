@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::ptr::{self, NonNull};
+use std::ptr::NonNull;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -11,15 +11,15 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 use futures_task::waker;
 pub use futures_task::{waker_ref, ArcWake, WakerRef};
 
-/// Convert an instance of a type implementing [`Wake`] or [`ArcWake`] into a
-/// [`Waker`].
-pub fn waker_from<W: IntoWaker>(inst: W) -> Waker {
-    inst.into_waker()
-}
-
 /// A generic trait for types that can be woken by reference.
 pub trait WakeByRef: Send + Sync {
     fn wake_by_ref(&self);
+}
+
+impl WakeByRef for std::thread::Thread {
+    fn wake_by_ref(&self) {
+        self.unpark()
+    }
 }
 
 pub trait IntoWaker {
@@ -128,7 +128,7 @@ impl<T: WakeByRef> WakeableState<T> {
                 // use an acquire load to synchronize specifically with release
                 // writes to count on other threads
                 (&*data).count.load(Ordering::Acquire);
-                ptr::drop_in_place(data);
+                Box::from_raw(data);
             }
         }
     }
