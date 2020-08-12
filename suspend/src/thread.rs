@@ -1,24 +1,21 @@
 use std::cell::Cell;
-use std::ops::Deref;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread::{self, Thread};
 use std::time::Instant;
 
-const WAKE_STATE_IDLE: usize = 0b00;
-const WAKE_STATE_WOKEN: usize = 0b01;
+const WAKE_STATE_IDLE: usize = 0b000;
+const WAKE_STATE_WOKEN: usize = 0b001;
 const MIN_SEQNO: usize = WAKE_STATE_WOKEN + 1;
+
 const REF_STATE_IDLE: u8 = 0b000;
 const REF_STATE_WOKEN: u8 = 0b001;
 const REF_STATE_ACQUIRED: u8 = 0b010;
 const REF_STATE_CREATED: u8 = 0b100;
 
 thread_local! {
-    static THREAD_SUSPEND: (ThreadWakeHandle, Cell<usize>) = (
-        ThreadWakeHandle::new(thread::current()),
-        Cell::new(MIN_SEQNO - 1)
-    );
+    static THREAD_WAKE_HANDLE: ThreadWakeHandle = ThreadWakeHandle::new(thread::current());
 }
 
 #[inline]
@@ -38,15 +35,8 @@ pub fn thread_suspend_deadline<F, R>(mut f: F, expire: Option<Instant>) -> Poll<
 where
     F: FnMut(&mut Context) -> Poll<R>,
 {
-    THREAD_SUSPEND.with(|(thread_wake, seqno_source)| {
-        let seqno = {
-            let mut seq = seqno_source.get().wrapping_add(1);
-            // handle overflow
-            seq = std::cmp::max(seq, MIN_SEQNO);
-            seqno_source.replace(seq);
-            seq
-        };
-        let mut wake_ref = thread_wake.wake_ref(seqno);
+    THREAD_WAKE_HANDLE.with(|thread_wake| {
+        let mut wake_ref = thread_wake.wake_ref();
         let waker = wake_ref.waker();
         let mut cx = Context::from_waker(&waker);
         let mut next_park_duration = None;
@@ -91,24 +81,31 @@ where
     })
 }
 
-struct ThreadWakeHandle(NonNull<ThreadWake>);
+struct ThreadWakeHandle(NonNull<ThreadWake>, Cell<usize>);
 
 impl ThreadWakeHandle {
     pub fn new(thread: Thread) -> Self {
-        Self(ThreadWake::new(thread, WAKE_STATE_IDLE, 1))
+        Self(
+            ThreadWake::new(thread, WAKE_STATE_IDLE, 1),
+            Cell::new(MIN_SEQNO - 1),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn load_seqno(&self) -> usize {
+        unsafe { self.0.as_ref() }.seqno.load(Ordering::Relaxed)
     }
 
     #[inline]
-    pub fn wake_ref(&self, seqno: usize) -> ThreadWakeRef {
+    pub fn wake_ref(&self) -> ThreadWakeRef {
+        let seqno = {
+            let mut seq = self.1.get().wrapping_add(1);
+            // handle overflow
+            seq = std::cmp::max(seq, MIN_SEQNO);
+            self.1.replace(seq);
+            seq
+        };
         ThreadWakeRef::new(self.0, seqno)
-    }
-}
-
-impl Deref for ThreadWakeHandle {
-    type Target = ThreadWake;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.0.as_ref() }
     }
 }
 
@@ -241,6 +238,8 @@ impl ThreadWakeRef {
                 // init with a count of 2, corresponding to this reference and the waker
                 inst.ptr = ThreadWake::new(inst.ptr.as_ref().thread.clone(), inst.seqno, 2);
             }
+        } else {
+            ThreadWake::inc_count(inst.ptr.as_ptr());
         }
         ThreadWakeClone::raw_waker(inst.ptr, inst.seqno)
     }
@@ -400,11 +399,12 @@ mod tests {
 
     #[test]
     fn thread_suspend_wake_delayed() {
+        let count = 2;
         let calls = Cell::new(0);
         assert_eq!(
             thread_suspend_deadline(
                 |cx| {
-                    if calls.replace(calls.get() + 1) == 0 {
+                    if calls.replace(calls.get() + 1) + 1 < count {
                         let waker = cx.waker().clone();
                         thread::spawn(move || {
                             thread::sleep(Duration::from_millis(10));
@@ -419,7 +419,7 @@ mod tests {
             ),
             Poll::Ready(())
         );
-        assert_eq!(calls.get(), 2);
+        assert_eq!(calls.get(), count);
     }
 
     #[test]
@@ -428,11 +428,24 @@ mod tests {
         let expire = Instant::now() + Duration::from_millis(500);
         assert_eq!(
             thread_suspend_deadline(
-                |_cx| {
+                |cx1| {
+                    let seqno0 = THREAD_WAKE_HANDLE.with(|w| w.load_seqno());
+                    assert_eq!(seqno0, WAKE_STATE_IDLE);
+
+                    // acquire thread local instance
+                    let _waker = cx1.waker().clone();
+                    let seqno1 = THREAD_WAKE_HANDLE.with(|w| w.load_seqno());
+                    assert!(seqno1 >= MIN_SEQNO);
+
                     thread_suspend_deadline(
-                        |cx| {
+                        |cx2| {
+                            // should have acquired a new instance, leaving thread-local
+                            // instance in the same state
+                            let seqno2 = THREAD_WAKE_HANDLE.with(|w| w.load_seqno());
+                            assert_eq!(seqno2, seqno1);
+
                             if calls.replace(calls.get() + 1) == 0 {
-                                let waker = cx.waker().clone();
+                                let waker = cx2.waker().clone();
                                 thread::spawn(move || {
                                     thread::sleep(Duration::from_millis(10));
                                     waker.wake();
