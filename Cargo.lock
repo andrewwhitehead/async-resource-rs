@@ -436,9 +436,9 @@ checksum = "0b631f7e854af39a1739f401cf34a8a013dfe09eac4fa4dba91e9768bd28168d"
 
 [[package]]
 name = "oneshot"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "100aa4d2a397aedbfbfa0fbd0ed6697ff88f8b33dd3457f67b5b0f74222522a0"
+checksum = "39d7085e4e51b36df4afa83db60d20ad2adf8e8587a193f93c9143bf7b375dec"
 dependencies = [
  "loom",
 ]

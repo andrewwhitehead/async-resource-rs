@@ -78,14 +78,13 @@ fn bench_many_drop_recv(c: &mut Criterion) {
             b.iter(|| futures_many(s, true));
         },
     );
-    // currently panics with 'internal error: entered unreachable code'
-    // c.bench_with_input(
-    //     BenchmarkId::new("oneshot-many-drop", count),
-    //     &count,
-    //     |b, &s| {
-    //         b.iter(|| oneshot_many(s, true));
-    //     },
-    // );
+    c.bench_with_input(
+        BenchmarkId::new("oneshot-many-drop", count),
+        &count,
+        |b, &s| {
+            b.iter(|| oneshot_many(s, true));
+        },
+    );
 }
 
 criterion_group!(benches, bench_many, bench_many_drop_recv);
