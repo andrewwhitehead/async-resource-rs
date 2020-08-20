@@ -4,9 +4,8 @@ use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{spin_loop_hint, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll, Waker};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use pin_utils::pin_mut;
@@ -14,12 +13,9 @@ use pin_utils::pin_mut;
 use super::thread::thread_suspend_deadline;
 use super::waker::{internal::WakeableState, WakeByRef};
 
-const IDLE: u8 = 0b000;
-const WAIT: u8 = 0b001;
-const LISTEN: u8 = 0b011;
-const LOCKED: u8 = 0b100;
-const LOCKED_WAIT: u8 = 0b101;
-const LOCKED_LISTEN: u8 = 0b111;
+const STATE_IDLE: u8 = 0b000;
+const STATE_WAIT: u8 = 0b001;
+const STATE_LISTEN: u8 = 0b011;
 
 // synchronize with release writes to a specific atomic variable
 macro_rules! acquire {
@@ -43,15 +39,19 @@ impl SuspendState {
     }
 
     pub const fn new_idle() -> Self {
-        Self::new(IDLE)
+        Self::new(STATE_IDLE)
     }
 
     pub const fn new_waiting() -> Self {
-        Self::new(WAIT)
+        Self::new(STATE_WAIT)
     }
 
     pub fn try_acquire(&self) -> bool {
-        if self.state.compare_and_swap(IDLE, WAIT, Ordering::Release) == IDLE {
+        if self
+            .state
+            .compare_and_swap(STATE_IDLE, STATE_WAIT, Ordering::Release)
+            == STATE_IDLE
+        {
             acquire!(self.state);
             true
         } else {
@@ -60,11 +60,11 @@ impl SuspendState {
     }
 
     pub fn clear_waiting(&mut self) -> bool {
-        let prev = self.state.fetch_and(!LISTEN, Ordering::Release);
-        match prev & LISTEN {
-            IDLE => false,
-            WAIT => true,
-            LISTEN => {
+        let prev = self.state.fetch_and(!STATE_LISTEN, Ordering::Release);
+        match prev & STATE_LISTEN {
+            STATE_IDLE => false,
+            STATE_WAIT => true,
+            STATE_LISTEN => {
                 acquire!(self.state);
                 unsafe { self.drop_waker() };
                 true
@@ -74,22 +74,22 @@ impl SuspendState {
     }
 
     pub fn check_idle(&self) -> bool {
-        self.state.load(Ordering::Acquire) & LISTEN == IDLE
+        self.state.load(Ordering::Acquire) & STATE_LISTEN == STATE_IDLE
     }
 
     /// Try to start listening with a new waker
     pub fn poll(&mut self, cx: &mut Context) -> Poll<()> {
         match self.state.load(Ordering::Acquire) {
-            IDLE | LOCKED => {
+            STATE_IDLE => {
                 // not currently acquired
                 return Poll::Ready(());
             }
-            WAIT => (),
-            LISTEN => {
+            STATE_WAIT => (),
+            STATE_LISTEN => {
                 // try to reacquire wait state
                 match self.state.compare_exchange(
-                    LISTEN,
-                    WAIT,
+                    STATE_LISTEN,
+                    STATE_WAIT,
                     Ordering::Release,
                     Ordering::Relaxed,
                 ) {
@@ -97,23 +97,18 @@ impl SuspendState {
                         acquire!(self.state);
                         unsafe { self.drop_waker() };
                     }
-                    Err(WAIT) => {
+                    Err(STATE_WAIT) => {
                         // competition from another thread?
                         // should not happen with wrappers around this instance
                         panic!("Invalid state");
                     }
-                    Err(IDLE) | Err(LOCKED) => {
+                    Err(STATE_IDLE) => {
                         // already notified, or being notified
                         acquire!(self.state);
                         return Poll::Ready(());
                     }
                     Err(_) => panic!("Invalid state"),
                 }
-            }
-            LOCKED_WAIT | LOCKED_LISTEN => {
-                // about to be notified. call the new waker to poll again immediately
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
             }
             _ => panic!("Invalid state"),
         }
@@ -124,110 +119,32 @@ impl SuspendState {
             self.store_waker(cx.waker().clone());
         }
 
-        match self
-            .state
-            .compare_exchange(WAIT, LISTEN, Ordering::Release, Ordering::Relaxed)
-        {
+        match self.state.compare_exchange(
+            STATE_WAIT,
+            STATE_LISTEN,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => {
                 // registered listener
                 Poll::Pending
             }
-            Err(IDLE) => {
+            Err(STATE_IDLE) => {
                 // notify() was called while storing
                 acquire!(self.state);
                 unsafe { self.drop_waker() };
                 Poll::Ready(())
             }
-            Err(LOCKED_WAIT) => {
-                // lock() was called while storing. call new the waker now,
-                // so the listener will poll again for the result
-                acquire!(self.state);
-                unsafe { self.wake_waker() };
-                Poll::Pending
-            }
             _ => panic!("Invalid state"),
-        }
-    }
-
-    pub fn lock(&mut self) -> (bool, bool) {
-        let prev = self.state.fetch_or(LOCKED, Ordering::AcqRel);
-        (prev & LOCKED == 0, prev & LISTEN != 0)
-    }
-
-    /// Clear the waiting state and set the LOCKED bit. This is used to
-    /// indicate when the listener is cancelling a notification, as in the
-    /// one-shot Task. Returns a pair of (acquired, cleared) where acquired
-    /// indicates that the LOCKED bit was not previously set, and cleared
-    /// indicates that the state was either WAIT or LISTEN.
-    pub fn lock_and_clear_waiting(&mut self) -> (bool, bool) {
-        let prev = self.state.swap(LOCKED, Ordering::AcqRel);
-        let cleared = match prev & LISTEN {
-            IDLE => false,
-            WAIT => true,
-            LISTEN => {
-                unsafe { self.drop_waker() };
-                true
-            }
-            _ => panic!("Invalid state"),
-        };
-        (prev & LOCKED == 0, cleared)
-    }
-
-    /// Clear the state if it is waiting, and call the notifier if any.
-    /// Returns a pair of (held, notified) where held indicates that the
-    /// lock was still held when the notify occurred.
-    pub fn locked_notify(&self) -> (bool, bool) {
-        let prev = self.state.swap(IDLE, Ordering::AcqRel);
-        (
-            prev & LOCKED == LOCKED,
-            match prev & LISTEN {
-                IDLE => false,
-                WAIT => true,
-                LISTEN => {
-                    unsafe { self.wake_waker() };
-                    true
-                }
-                _ => panic!("Invalid state"),
-            },
-        )
-    }
-
-    pub fn unlock(&mut self) -> bool {
-        self.state.fetch_and(!LOCKED, Ordering::AcqRel) & LOCKED == LOCKED
-    }
-
-    pub fn unlock_and_clear_waiting(&mut self) -> bool {
-        match self.state.swap(IDLE, Ordering::AcqRel) {
-            IDLE => false,
-            LISTEN | LOCKED_LISTEN => {
-                unsafe { self.drop_waker() };
-                true
-            }
-            _ => true,
-        }
-    }
-
-    pub fn wait_unlock(&self) {
-        let mut i = 1;
-        loop {
-            if self.state.load(Ordering::Acquire) & LOCKED == 0 {
-                return;
-            }
-            if i % 100 == 0 {
-                thread::yield_now();
-            } else {
-                spin_loop_hint();
-            }
-            i += 1;
         }
     }
 
     /// Clear the state if it is waiting, and call the notifier if any.
     /// Returns true if there was an active listener.
     pub fn notify(&self) {
-        match self.state.swap(IDLE, Ordering::Release) & LISTEN {
-            IDLE | WAIT => (),
-            LISTEN => {
+        match self.state.swap(STATE_IDLE, Ordering::Release) & STATE_LISTEN {
+            STATE_IDLE | STATE_WAIT => (),
+            STATE_LISTEN => {
                 acquire!(self.state);
                 unsafe { self.wake_waker() };
             }
@@ -240,15 +157,18 @@ impl SuspendState {
         self.state.load(Ordering::SeqCst)
     }
 
-    pub unsafe fn drop_waker(&mut self) {
+    #[inline]
+    unsafe fn drop_waker(&mut self) {
         ptr::drop_in_place(self.waker.as_mut_ptr());
     }
 
-    pub unsafe fn store_waker(&mut self, waker: Waker) {
+    #[inline]
+    unsafe fn store_waker(&mut self, waker: Waker) {
         self.waker.as_mut_ptr().write(waker)
     }
 
-    pub unsafe fn wake_waker(&self) {
+    #[inline]
+    unsafe fn wake_waker(&self) {
         ptr::read(&self.waker).assume_init().wake();
     }
 
@@ -484,9 +404,9 @@ impl Suspend {
 impl Debug for Suspend {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let state = match self.shared.state() {
-            IDLE => "Idle",
-            WAIT => "Waiting",
-            LISTEN => "Listening",
+            STATE_IDLE => "Idle",
+            STATE_WAIT => "Waiting",
+            STATE_LISTEN => "Listening",
             _ => "<!>",
         };
         write!(f, "Suspend({})", state)
@@ -564,9 +484,9 @@ impl Listener<'_> {
 impl Debug for Listener<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let state = match self.shared.state() {
-            IDLE => "Notified",
-            WAIT => "Waiting",
-            LISTEN => "Polled",
+            STATE_IDLE => "Notified",
+            STATE_WAIT => "Waiting",
+            STATE_LISTEN => "Polled",
             _ => "<!>",
         };
         write!(f, "Listener({})", state)

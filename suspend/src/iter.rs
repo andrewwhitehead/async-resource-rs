@@ -13,9 +13,9 @@ pub type BoxFusedStream<'t, T> = Pin<Box<dyn FusedStream<Item = T> + Send + 't>>
 
 /// A convenience method to turn a `Stream` into an `Iterator` which parks the
 /// current thread until items are available.
-pub fn iter_stream<'s, S>(stream: S) -> Iter<'s, S::Item>
+pub fn iter_stream<S>(stream: S) -> Iter<'static, S::Item>
 where
-    S: Stream + Send + 's,
+    S: Stream + Send + 'static,
 {
     Iter::from_stream(stream)
 }
@@ -53,22 +53,22 @@ pub struct Iter<'s, T> {
     state: IterState<'s, T>,
 }
 
-impl<'s, T> Iter<'s, T> {
+impl<T> Iter<'static, T> {
     /// Create a new `Iter` from a function returning `Poll<Option<T>>`. If
     /// the function is already boxed, then it would be more efficent to use
     /// `Iter::from`.
     pub fn from_poll_next<F>(f: F) -> Self
     where
-        F: FnMut(&mut Context) -> Poll<Option<T>> + Send + 's,
+        F: FnMut(&mut Context) -> Poll<Option<T>> + Send + 'static,
     {
-        Self::from(Box::new(f) as PollNextFn<'s, T>)
+        Self::from(Box::new(f) as PollNextFn<'static, T>)
     }
 
     /// Create a new `Iter` from a `Stream<T>`. If the stream is already boxed,
     /// then it would be more efficent to use `Iter::from`.
     pub fn from_iter<I>(iter: I) -> Self
     where
-        I: IntoIterator<Item = T> + 's,
+        I: IntoIterator<Item = T> + 'static,
         <I as IntoIterator>::IntoIter: Send,
     {
         let mut iter = iter.into_iter();
@@ -79,35 +79,36 @@ impl<'s, T> Iter<'s, T> {
     /// then it would be more efficent to use `Iter::from`.
     pub fn from_fused_stream<S>(s: S) -> Self
     where
-        S: FusedStream<Item = T> + Send + 's,
+        S: FusedStream<Item = T> + Send + 'static,
     {
-        Self::from(Box::pin(s) as BoxFusedStream<'s, T>)
+        Self::from(Box::pin(s) as BoxFusedStream<'static, T>)
     }
 
     /// Create a new `Iter` from a `Stream<T>`. If the stream is already boxed,
     /// then it would be more efficent to use `Iter::from`.
     pub fn from_stream<S>(s: S) -> Self
     where
-        S: Stream<Item = T> + Send + 's,
+        S: Stream<Item = T> + Send + 'static,
     {
-        Self::from(Box::pin(s) as BoxStream<'s, T>)
+        Self::from(Box::pin(s) as BoxStream<'static, T>)
     }
 
+    /// Map the items of the `Iter` using a transformation function.
+    pub fn map<F, R>(self, f: F) -> Iter<'static, R>
+    where
+        F: Fn(T) -> R + Send + 'static,
+        T: 'static,
+    {
+        let mut state = self.state;
+        Iter::from_poll_next(move |cx| state.poll_next(cx).map(|opt| opt.map(&f)))
+    }
+}
+
+impl<'s, T> Iter<'s, T> {
     /// If the `Iter` is wrapping a `FusedStream`, then this method will return
     /// `true` when the stream should no longer be polled.
     pub fn is_terminated(&self) -> bool {
         self.state.is_terminated()
-    }
-
-    /// Map the items of the `Iter` using a transformation function.
-    pub fn map<'m, F, R>(self, f: F) -> Iter<'m, R>
-    where
-        F: Fn(T) -> R + Send + 'm,
-        T: 'm,
-        's: 'm,
-    {
-        let mut state = self.state;
-        Iter::from_poll_next(move |cx| state.poll_next(cx).map(|opt| opt.map(&f)))
     }
 
     /// Create a new future which resolves to the next item in the stream.
@@ -139,27 +140,25 @@ impl<'s, T> Iter<'s, T> {
     }
 }
 
-impl<'t, T, E> Iter<'t, Result<T, E>> {
+impl<T, E> Iter<'static, Result<T, E>> {
     /// A helper method to map the `Ok(T)` item of the `Iter<Result<T, E>>`
     /// using a transformation function.
-    pub fn map_ok<'m, F, R>(self, f: F) -> Iter<'m, Result<R, E>>
+    pub fn map_ok<F, R>(self, f: F) -> Iter<'static, Result<R, E>>
     where
-        F: Fn(T) -> R + Send + 'm,
-        T: 'm,
-        E: 'm,
-        't: 'm,
+        F: Fn(T) -> R + Send + 'static,
+        T: 'static,
+        E: 'static,
     {
         self.map(move |r| r.map(&f))
     }
 
     /// A helper method to map the `Err(E)` item of the `Iter<Result<T, E>>`
     /// using a transformation function.
-    pub fn map_err<'m, F, R>(self, f: F) -> Iter<'m, Result<T, R>>
+    pub fn map_err<F, R>(self, f: F) -> Iter<'static, Result<T, R>>
     where
-        F: Fn(E) -> R + Send + 'm,
-        T: 'm,
-        E: 'm,
-        't: 'm,
+        F: Fn(E) -> R + Send + 'static,
+        T: 'static,
+        E: 'static,
     {
         self.map(move |r| r.map_err(&f))
     }

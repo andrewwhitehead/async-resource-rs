@@ -70,6 +70,8 @@ pub mod re_export {
     pub use std::pin::Pin;
 }
 
+mod channel;
+
 mod core;
 pub use self::core::{Listener, Notifier, Suspend};
 
@@ -83,8 +85,6 @@ pub use self::iter::{iter_stream, Iter};
 
 mod helpers;
 pub use self::helpers::{block_on, block_on_deadline};
-
-mod oneshot;
 
 /// Support for creating pollable [`Task`] instances, implementing `Future`
 /// and having additional flexibility.

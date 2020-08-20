@@ -6,13 +6,13 @@ use std::time::{Duration, Instant};
 
 use futures_core::future::{BoxFuture, FusedFuture};
 
+use super::channel::{Channel, TaskReceiver};
 use super::core::{Notifier, SharedSuspend};
 use super::error::Incomplete;
 use super::helpers::{block_on, block_on_deadline};
-use super::oneshot::{Channel, TaskReceiver};
 use super::thread::{thread_suspend, thread_suspend_deadline};
 
-pub use super::oneshot::TaskSender;
+pub use super::channel::TaskSender;
 
 /// A polling function equivalent to `Future::poll`.
 pub type PollFn<'a, T> = Box<dyn FnMut(&mut Context) -> Poll<T> + Send + 'a>;
