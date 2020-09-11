@@ -8,7 +8,7 @@ fn message_many(count: usize, drop_recv: bool) {
     let mut sus = Suspend::new();
     for _ in 0..count {
         let (sender, mut receiver) = message_task();
-        sus.poll_unpin(&mut receiver).unwrap_err();
+        sus.poll_future_unpin(&mut receiver).unwrap_err();
         if drop_recv {
             drop(receiver);
             sender.send(1).unwrap_err();
@@ -23,7 +23,7 @@ fn futures_many(count: usize, drop_recv: bool) {
     let mut sus = Suspend::new();
     for _ in 0..count {
         let (sender, mut receiver) = futures_oneshot::channel();
-        sus.poll_unpin(&mut receiver).unwrap_err();
+        sus.poll_future_unpin(&mut receiver).unwrap_err();
         if drop_recv {
             drop(receiver);
             sender.send(1).unwrap_err();
@@ -38,7 +38,7 @@ fn oneshot_many(count: usize, drop_recv: bool) {
     let mut sus = Suspend::new();
     for _ in 0..count {
         let (sender, mut receiver) = oneshot::channel();
-        sus.poll_unpin(&mut receiver).unwrap_err();
+        sus.poll_future_unpin(&mut receiver).unwrap_err();
         if drop_recv {
             drop(receiver);
             sender.send(1).unwrap_err();

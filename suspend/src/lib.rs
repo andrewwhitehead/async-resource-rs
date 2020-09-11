@@ -62,7 +62,7 @@
 //! ```
 //! let mut susp = suspend::Suspend::new();
 //! let mut task = suspend::Task::from_fut(async { 99 });
-//! assert_eq!(susp.poll_unpin(&mut task), Ok(99));
+//! assert_eq!(susp.poll_future_unpin(&mut task), Ok(99));
 //! ```
 
 #[doc(hidden)]

@@ -8,8 +8,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use pin_utils::pin_mut;
-
 use super::thread::thread_suspend_deadline;
 use super::waker::{internal::WakeableState, WakeByRef};
 
@@ -318,23 +316,23 @@ impl Suspend {
 
     /// Poll a `Future`, returning the result if ready, otherwise a `Listener`
     /// instance which will be notified when the future should be polled again.
-    pub fn poll<F>(&mut self, fut: Pin<&mut F>) -> Result<F::Output, Listener<'_>>
+    pub fn poll_future<F>(&mut self, fut: Pin<&mut F>) -> Result<F::Output, Listener<'_>>
     where
         F: Future,
     {
         let mut listener = self.listen();
-        match listener.poll(fut) {
+        match listener.poll_future(fut) {
             Poll::Ready(r) => Ok(r),
             Poll::Pending => Err(listener),
         }
     }
 
     /// A convenience method to poll a `Future + Unpin`.
-    pub fn poll_unpin<F>(&mut self, fut: &mut F) -> Result<F::Output, Listener<'_>>
+    pub fn poll_future_unpin<F>(&mut self, fut: &mut F) -> Result<F::Output, Listener<'_>>
     where
         F: Future + Unpin,
     {
-        self.poll(Pin::new(fut))
+        self.poll_future(Pin::new(fut))
     }
 
     /// Try to construct a `Listener` and start listening for notifications
@@ -353,9 +351,9 @@ impl Suspend {
     where
         F: Future,
     {
-        pin_mut!(fut);
+        futures_lite::pin!(fut);
         loop {
-            match self.poll(fut.as_mut()) {
+            match self.poll_future(fut.as_mut()) {
                 Ok(result) => break result,
                 Err(listen) => listen.wait(),
             }
@@ -370,7 +368,7 @@ impl Suspend {
         F: Future + Unpin,
     {
         loop {
-            match self.poll_unpin(&mut fut) {
+            match self.poll_future_unpin(&mut fut) {
                 Ok(result) => break Ok(result),
                 Err(listen) => {
                     if listen.wait_deadline(expire).is_err() {
@@ -391,6 +389,25 @@ impl Suspend {
         match Instant::now().checked_add(timeout) {
             Some(expire) => self.wait_on_deadline(fut, expire),
             None => Err(fut),
+        }
+    }
+
+    /// Block on the result of a `Future`, aborting if and when the given
+    /// predicate function returns `false`.
+    pub fn wait_on_while<F, C>(&mut self, fut: F, mut cond: C) -> Option<F::Output>
+    where
+        F: Future,
+        C: FnMut() -> bool,
+    {
+        futures_lite::pin!(fut);
+        loop {
+            match self.poll_future(fut.as_mut()) {
+                Ok(result) => break Some(result),
+                Err(listen) => listen.wait(),
+            }
+            if !(cond)() {
+                break None;
+            }
         }
     }
 
@@ -434,7 +451,7 @@ impl Listener<'_> {
     }
 
     /// Poll a `Future`, which will then notify this listener when ready.
-    pub fn poll<F>(&mut self, fut: Pin<&mut F>) -> Poll<F::Output>
+    pub fn poll_future<F>(&mut self, fut: Pin<&mut F>) -> Poll<F::Output>
     where
         F: Future,
     {
@@ -443,11 +460,11 @@ impl Listener<'_> {
     }
 
     /// A convenience method to poll a `Future + Unpin`.
-    pub fn poll_unpin<F>(&mut self, fut: &mut F) -> Poll<F::Output>
+    pub fn poll_future_unpin<F>(&mut self, fut: &mut F) -> Poll<F::Output>
     where
         F: Future + Unpin,
     {
-        self.poll(Pin::new(fut))
+        self.poll_future(Pin::new(fut))
     }
 
     /// Wait for a notification on the associated `Suspend` instance, parking

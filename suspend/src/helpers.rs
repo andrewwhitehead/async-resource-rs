@@ -3,8 +3,6 @@ use std::pin::Pin;
 use std::task::Poll;
 use std::time::Instant;
 
-use pin_utils::pin_mut;
-
 use super::thread::{thread_suspend, thread_suspend_deadline};
 
 /// A convenience method to evaluate a `Future`, blocking the current thread
@@ -13,7 +11,7 @@ pub fn block_on<F>(fut: F) -> F::Output
 where
     F: Future,
 {
-    pin_mut!(fut);
+    futures_lite::pin!(fut);
     thread_suspend(|cx| fut.as_mut().poll(cx))
 }
 
