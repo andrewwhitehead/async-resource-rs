@@ -3,12 +3,14 @@ use std::time::Duration;
 
 use suspend::Suspend;
 
-use super::error::ConfigError;
-use super::executor::{default_executor, Executor};
-use super::operation::{resource_create, resource_verify, ResourceOperation};
-use super::pool::{ErrorFn, Pool, PoolInternal};
+use crate::executor::{default_executor, Executor};
 use crate::resource::ResourceInfo;
 use crate::shared::{DisposeFn, ReleaseFn};
+
+use super::error::ConfigError;
+use super::operation::{resource_create, resource_verify, ResourceOperation};
+use super::pool::{ErrorFn, Pool, PoolInternal};
+
 /// A pool configuration instance, used to build a new instance of a resource
 /// pool.
 pub struct PoolConfig<T: Send, E> {

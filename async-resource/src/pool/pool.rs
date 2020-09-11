@@ -13,12 +13,12 @@ use concurrent_queue::ConcurrentQueue;
 use futures_lite::future::FutureExt;
 use suspend::{Notifier, Suspend};
 
+use crate::executor::Executor;
 use crate::resource::{ResourceGuard, ResourceInfo, ResourceLock};
 use crate::shared::{DisposeFn, ReleaseFn, Shared, SharedEvent};
 use crate::util::sentinel::Sentinel;
 
 use super::acquire;
-use super::executor::Executor;
 use super::operation::{ResourceFuture, ResourceOperation, ResourceResolve};
 use super::wait::{waiter_pair, WaitResponder, Waiter};
 

@@ -7,9 +7,6 @@ pub use config::PoolConfig;
 mod error;
 pub use error::{AcquireError, ConfigError};
 
-mod executor;
-pub use executor::{default_executor, Executor};
-
 mod operation;
 
 mod pool;
