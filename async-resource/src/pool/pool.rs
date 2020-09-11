@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use concurrent_queue::ConcurrentQueue;
-use futures_util::FutureExt;
+use futures_lite::future::FutureExt;
 use suspend::{Notifier, Suspend};
 
 use crate::resource::{ResourceGuard, ResourceInfo, ResourceLock};
@@ -310,15 +310,17 @@ impl<T: Send, E> PoolInternal<T, E> {
         if res.is_pending() {
             let inner = self.clone();
             self.manage.executor.spawn_ok(
-                res.map(move |res| match res {
-                    Some(Ok(res)) => {
-                        inner.shared.release(res);
+                async move {
+                    match res.await {
+                        Some(Ok(res)) => {
+                            inner.shared.release(res);
+                        }
+                        Some(Err(err)) => {
+                            inner.handle_error(err);
+                        }
+                        None => (),
                     }
-                    Some(Err(err)) => {
-                        inner.handle_error(err);
-                    }
-                    None => (),
-                })
+                }
                 .boxed(),
             )
         }

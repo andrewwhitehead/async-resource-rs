@@ -41,7 +41,7 @@ impl<E: Debug + Display> std::error::Error for AcquireError<E> {}
 
 /// A configuration error.
 #[derive(Debug)]
-pub struct ConfigError(String);
+pub struct ConfigError(pub String);
 
 impl Display for ConfigError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

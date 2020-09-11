@@ -1,6 +1,5 @@
+use std::future::Future;
 use std::time::Duration;
-
-use futures_util::future::TryFuture;
 
 use suspend::Suspend;
 
@@ -32,7 +31,7 @@ impl<T: Send, E> PoolConfig<T, E> {
     pub fn new<C, F>(create: C) -> Self
     where
         C: Fn() -> F + Send + Sync + 'static,
-        F: TryFuture<Ok = T, Error = E> + Send + 'static,
+        F: Future<Output = Result<T, E>> + Send + 'static,
         T: Send + 'static,
         E: 'static,
     {
@@ -99,7 +98,7 @@ impl<T: Send, E> PoolConfig<T, E> {
     pub fn verify<V, F>(mut self, verify: V) -> Self
     where
         V: Fn(&mut T, ResourceInfo) -> F + Send + Sync + 'static,
-        F: TryFuture<Ok = bool, Error = E> + Send + 'static,
+        F: Future<Output = Result<bool, E>> + Send + 'static,
         T: Send + 'static,
         E: 'static,
     {

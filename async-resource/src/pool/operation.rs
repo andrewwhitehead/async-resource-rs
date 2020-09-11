@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use futures_util::future::{BoxFuture, FutureExt, TryFuture, TryFutureExt};
+use futures_lite::future::{Boxed as BoxFuture, FutureExt};
 
 use super::pool::PoolInternal;
 use crate::resource::{ResourceGuard, ResourceInfo};
 use crate::shared::Shared;
 
-pub type ResourceFuture<T, E> = BoxFuture<'static, Result<ResourceGuard<T>, E>>;
+pub type ResourceFuture<T, E> = BoxFuture<Result<ResourceGuard<T>, E>>;
 
 pub enum ResourceResolveType<T: Send + 'static, E: 'static> {
     Resource(Option<(ResourceGuard<T>, Arc<Shared<T>>)>),
@@ -123,20 +123,21 @@ where
 pub fn resource_create<C, F, T, E>(ctor: C) -> impl ResourceOperation<T, E>
 where
     C: Fn() -> F + Send + Sync,
-    F: TryFuture<Ok = T, Error = E> + Send + 'static,
+    F: Future<Output = Result<T, E>> + Send + 'static,
     T: Send + 'static,
 {
     ResourceUpdateFn {
         inner: move |mut guard: ResourceGuard<T>| {
             assert!(guard.is_none());
             let result = ctor();
-            result
-                .and_then(|res| async move {
+            async move {
+                result.await.map(|res| {
                     guard.replace(res);
                     guard.info_mut().created_at.replace(Instant::now());
-                    Ok(guard)
+                    guard
                 })
-                .boxed()
+            }
+            .boxed()
         },
     }
 }
@@ -144,20 +145,21 @@ where
 pub fn resource_verify<C, F, T, E>(update: C) -> impl ResourceOperation<T, E>
 where
     C: Fn(&mut T, ResourceInfo) -> F + Send + Sync,
-    F: TryFuture<Ok = bool, Error = E> + Send + 'static,
+    F: Future<Output = Result<bool, E>> + Send + 'static,
     T: Send + 'static,
 {
     ResourceUpdateFn {
         inner: move |mut guard: ResourceGuard<T>| {
             let mut res = guard.take().unwrap();
             let result = update(&mut res, *guard.info());
-            result
-                .and_then(|verified| async move {
+            async move {
+                result.await.map(|verified| {
                     guard.replace(res);
                     guard.info_mut().expired = !verified;
-                    Ok(guard)
+                    guard
                 })
-                .boxed()
+            }
+            .boxed()
         },
     }
 }

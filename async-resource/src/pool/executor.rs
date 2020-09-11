@@ -1,4 +1,4 @@
-use futures_util::future::BoxFuture;
+use futures_lite::future::Boxed as BoxFuture;
 
 use super::error::ConfigError;
 
@@ -6,70 +6,76 @@ use super::error::ConfigError;
 /// resource pool.
 pub trait Executor: Send + Sync {
     /// Spawn a static, boxed Future with no return value
-    fn spawn_ok(&self, task: BoxFuture<'static, ()>);
+    fn spawn_ok(&self, task: BoxFuture<()>);
 }
 
-#[cfg(feature = "multitask-exec")]
-mod multitask_exec {
+#[cfg(feature = "bounded-exec")]
+mod bounded_exec {
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
     use std::thread;
 
-    use multitask::Executor as MTExecutor;
+    use async_executor::Executor as AsyncExecutor;
+    use event_listener::Event;
     use option_lock::{self, OptionLock};
-    use suspend::{Notifier, Suspend};
 
     use super::BoxFuture;
     use super::Executor;
     use crate::util::sentinel::Sentinel;
 
-    const GLOBAL_INST: OptionLock<MultitaskExecutor> = OptionLock::new();
+    const GLOBAL_INST: OptionLock<BoundedExecutor> = OptionLock::new();
 
-    pub struct MultitaskExecutor {
-        inner: Sentinel<(MTExecutor, Vec<(thread::JoinHandle<()>, Notifier)>)>,
+    struct Inner {
+        active: AtomicUsize,
+        exec: AsyncExecutor,
+        running: AtomicBool,
+        shutdown: Event,
     }
 
-    impl MultitaskExecutor {
+    impl Inner {
+        fn run_thread(self: Arc<Self>) -> thread::JoinHandle<()> {
+            let listen = self.shutdown.listen();
+            thread::spawn(move || {
+                let inner = Sentinel::new(self, |inner, _| {
+                    inner.active.fetch_sub(1, Ordering::Release);
+                    if inner.running.load(Ordering::Acquire) {
+                        // restart panicked thread
+                        inner.run_thread();
+                    }
+                });
+                inner.active.fetch_add(1, Ordering::Release);
+                suspend::block_on(inner.exec.run(listen))
+            })
+        }
+    }
+
+    pub struct BoundedExecutor {
+        inner: Sentinel<Inner>,
+    }
+
+    impl BoundedExecutor {
         pub fn new(threads: usize) -> Self {
             assert_ne!(threads, 0);
-            let ex = MTExecutor::new();
-            let running = Arc::new(AtomicBool::new(true));
-            let tickers = (0..threads)
-                .map(|_| {
-                    let mut suspend = Suspend::new();
-                    let parent_notifier = suspend.notifier();
-                    let ticker_notifier = suspend.notifier();
-                    let ticker = ex.ticker(move || ticker_notifier.notify());
-                    let running = running.clone();
-                    (
-                        thread::spawn(move || loop {
-                            let listener = suspend.listen();
-                            if !ticker.tick() {
-                                if !running.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                listener.wait();
-                            }
-                        }),
-                        parent_notifier,
-                    )
-                })
-                .collect();
+            let inner = Arc::new(Inner {
+                active: AtomicUsize::new(0),
+                exec: AsyncExecutor::new(),
+                running: AtomicBool::new(false),
+                shutdown: Event::new(),
+            });
+            for _ in 0..threads {
+                inner.clone().run_thread();
+            }
 
             Self {
-                inner: Sentinel::new(Arc::new((ex, tickers)), move |inner, count| {
+                inner: Sentinel::new(inner, move |inner, count| {
                     if count == 0 {
-                        running.store(false, Ordering::Release);
-                        if let Ok((_, threads)) = Arc::try_unwrap(inner) {
-                            for (thread, notifier) in threads {
-                                notifier.notify();
-                                thread.join().unwrap();
-                            }
-                        } else {
-                            panic!("Error unwrapping executor state")
-                        }
+                        inner.running.store(false, Ordering::Release);
+                        // FIXME loop until active is 0, add a waker to allow await of the executor
+                        inner
+                            .shutdown
+                            .notify(inner.active.load(Ordering::Acquire) + 1);
                     }
                 }),
             }
@@ -95,7 +101,7 @@ mod multitask_exec {
         }
     }
 
-    impl Clone for MultitaskExecutor {
+    impl Clone for BoundedExecutor {
         fn clone(&self) -> Self {
             Self {
                 inner: self.inner.clone(),
@@ -103,26 +109,26 @@ mod multitask_exec {
         }
     }
 
-    impl Executor for MultitaskExecutor {
-        fn spawn_ok(&self, task: BoxFuture<'static, ()>) {
-            self.inner.0.spawn(task).detach()
+    impl Executor for BoundedExecutor {
+        fn spawn_ok(&self, task: BoxFuture<()>) {
+            self.inner.exec.spawn(task).detach()
         }
     }
 }
 
-#[cfg(feature = "multitask-exec")]
-pub use multitask_exec::MultitaskExecutor;
+#[cfg(feature = "bounded-exec")]
+pub use self::bounded_exec::BoundedExecutor;
 
-#[cfg(feature = "multitask-exec")]
+#[cfg(feature = "bounded-exec")]
 /// Returns a default [`Executor`] instance to use when constructing a resource
 /// pool.
 pub fn default_executor() -> Result<Box<dyn Executor>, ConfigError> {
-    Ok(Box::new(multitask_exec::MultitaskExecutor::global()))
+    Ok(Box::new(self::bounded_exec::BoundedExecutor::global()))
 }
 
-#[cfg(not(any(feature = "multitask-exec")))]
+#[cfg(not(any(feature = "bounded-exec")))]
 /// Returns a default [`Executor`] instance to use when constructing a resource
 /// pool.
 pub fn default_executor() -> Result<Box<dyn Executor>, ConfigError> {
-    Err(ConfigError("No default executor is provided"))
+    Err(ConfigError("No default executor is provided".to_owned()))
 }
