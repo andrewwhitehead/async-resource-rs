@@ -24,17 +24,16 @@ struct Inner {
 
 impl Inner {
     fn run_thread(self: Arc<Self>) -> thread::JoinHandle<()> {
-        let listen = self.shutdown.listen();
         thread::spawn(move || {
             let inner = Sentinel::new(self, |inner, _| {
                 inner.active.fetch_sub(1, Ordering::Release);
-                if inner.running.load(Ordering::Acquire) {
-                    // restart panicked thread
+                if thread::panicking() && inner.running.load(Ordering::Acquire) {
+                    // start a new worker thread
                     inner.run_thread();
                 }
             });
             inner.active.fetch_add(1, Ordering::Release);
-            suspend::block_on(inner.exec.run(listen))
+            suspend::block_on(inner.exec.run(inner.shutdown.listen()))
         })
     }
 }
@@ -94,6 +93,12 @@ impl Clone for BoundedExecutor {
         Self {
             inner: self.inner.clone(),
         }
+    }
+}
+
+impl Default for BoundedExecutor {
+    fn default() -> Self {
+        Self::new(num_cpus::get())
     }
 }
 
