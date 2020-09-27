@@ -70,6 +70,8 @@ pub mod re_export {
     pub use std::pin::Pin;
 }
 
+pub mod async_stream;
+
 mod channel;
 
 mod core;
