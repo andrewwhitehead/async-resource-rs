@@ -2,30 +2,30 @@ use std::cell::UnsafeCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::ptr::drop_in_place;
+use std::ptr::{drop_in_place, NonNull};
 use std::task::{Context, Poll};
 
 use futures_core::{FusedStream, Stream};
 
 #[inline]
-pub(crate) unsafe fn channel_send<T>(channel: *mut Option<T>, value: T) {
-    if (&mut *channel).replace(value).is_some() {
+pub(crate) unsafe fn channel_send<T>(mut channel: NonNull<Option<T>>, value: T) {
+    if channel.as_mut().replace(value).is_some() {
         panic!("Invalid use of stream sender");
     }
 }
 
 #[inline]
-pub(crate) unsafe fn channel_recv<T>(channel: *mut Option<T>) -> Option<T> {
-    (&mut *channel).take()
+pub(crate) unsafe fn channel_recv<T>(mut channel: NonNull<Option<T>>) -> Option<T> {
+    channel.as_mut().take()
 }
 
 pub struct AsyncStreamSender<'a, T> {
-    channel: *mut Option<T>,
+    channel: NonNull<Option<T>>,
     _pd: PhantomData<&'a ()>,
 }
 
 impl<T> AsyncStreamSender<'_, T> {
-    pub(crate) fn new(channel: *mut Option<T>) -> Self {
+    pub(crate) fn new(channel: NonNull<Option<T>>) -> Self {
         Self {
             channel,
             _pd: PhantomData,
@@ -39,7 +39,7 @@ impl<T> AsyncStreamSender<'_, T> {
         unsafe {
             channel_send(self.channel, value);
             AsyncStreamSend {
-                channel: &mut *self.channel,
+                channel: self.channel.as_mut(),
                 first: true,
             }
         }
@@ -114,7 +114,9 @@ where
                         let mut copy = AsyncStreamState::Complete;
                         std::mem::swap(&mut copy, state);
                         if let AsyncStreamState::Init(init) = copy {
-                            let fut = init(AsyncStreamSender::new(self.channel.get()));
+                            let fut = init(AsyncStreamSender::new(NonNull::new_unchecked(
+                                self.channel.get(),
+                            )));
                             self.state.get().write(AsyncStreamState::Poll(fut));
                         } else {
                             unreachable!();
@@ -125,7 +127,9 @@ where
                             drop_in_place(fut);
                             self.state.get().write(AsyncStreamState::Complete);
                         } else {
-                            break if let Some(val) = channel_recv(self.channel.get()) {
+                            break if let Some(val) =
+                                channel_recv(NonNull::new_unchecked(self.channel.get()))
+                            {
                                 Poll::Ready(Some(val))
                             } else {
                                 Poll::Pending
@@ -133,7 +137,9 @@ where
                         }
                     }
                     AsyncStreamState::Complete => {
-                        break Poll::Ready(channel_recv(self.channel.get()));
+                        break Poll::Ready(channel_recv(NonNull::new_unchecked(
+                            self.channel.get(),
+                        )));
                     }
                 }
             }
@@ -152,7 +158,7 @@ where
 }
 
 pub struct TryStreamFut<'a, T, E, F> {
-    channel: *mut Option<Result<T, E>>,
+    channel: NonNull<Option<Result<T, E>>>,
     fut: F,
     _pd: PhantomData<&'a ()>,
 }
@@ -174,7 +180,7 @@ where
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         unsafe {
-            let channel = &mut *self.channel;
+            let channel = self.channel;
             let fut = self.map_unchecked_mut(|s| &mut s.fut);
             fut.poll(cx).map(|result| {
                 if let Err(err) = result {
