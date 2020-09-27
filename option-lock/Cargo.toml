@@ -1,6 +1,6 @@
 [package]
 name = "option-lock"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Andrew Whitehead <cywolf@gmail.com>"]
 edition = "2018"
 description = "A multi-purpose read/write lock for Option values"
@@ -8,7 +8,7 @@ license = "MIT/Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/andrewwhitehead/async-resource-rs/"
 categories = ["concurrency", "data-structures", "no-std"]
-keywords = ["atomic", "option", "lock", "take"]
+keywords = ["atomic", "once-cell", "option", "static", "lock"]
 
 [lib]
 name = "option_lock"
@@ -17,13 +17,23 @@ path = "src/lib.rs"
 [features]
 default = ["std"]
 std = []
+bench = ["criterion"]
 
-[dev-dependencies]
-criterion = "0.3"
+[dependencies]
+# should be a dev-dependency, but we only want it when running benches
+# slows down builds the rest of the time
+criterion = { version = "0.3", optional = true }
 
 [[bench]]
 name = "contention"
 harness = false
+required-features = ["bench"]
 
 [[example]]
 name = "atomic-wake"
+
+[[example]]
+name = "sync-results"
+
+[[example]]
+name = "try-mutex"

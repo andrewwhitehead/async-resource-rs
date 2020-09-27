@@ -11,19 +11,19 @@ use option_lock::OptionLock;
 // these tests are used mainly to check that no deadlocks occur with many threads
 
 fn lock_contention_yield(threads: usize) {
-    let lock = Arc::new(OptionLock::new());
+    let lock = Arc::new(OptionLock::empty());
     let done = Arc::new(AtomicUsize::new(0));
     for _ in 0..threads - 1 {
         let done = done.clone();
         let lock = lock.clone();
         thread::spawn(move || {
             let val = loop {
-                if let Ok(val) = lock.try_take() {
+                if let Some(val) = lock.try_take() {
                     break val;
                 }
                 loop {
                     thread::yield_now();
-                    if lock.status().can_take() {
+                    if lock.is_some_unlocked() {
                         break;
                     }
                 }
@@ -35,15 +35,13 @@ fn lock_contention_yield(threads: usize) {
     for val in 0..threads - 1 {
         expected += val;
         loop {
-            if let Ok(mut guard) = lock.try_lock() {
-                if guard.is_none() {
-                    guard.replace(val);
-                    break;
-                }
+            if let Some(mut guard) = lock.try_lock_none() {
+                guard.replace(val);
+                break;
             }
             loop {
                 thread::yield_now();
-                if !lock.status().is_locked() {
+                if !lock.is_locked() {
                     break;
                 }
             }
@@ -59,7 +57,7 @@ fn lock_contention_yield(threads: usize) {
 
 // this can take a very long time if threads > # cpu cores
 fn lock_contention_spin(threads: usize) {
-    let lock = Arc::new(OptionLock::new());
+    let lock = Arc::new(OptionLock::empty());
     let done = Arc::new(AtomicUsize::new(0));
     for _ in 0..threads - 1 {
         let done = done.clone();
@@ -72,13 +70,8 @@ fn lock_contention_spin(threads: usize) {
     let mut expected = 0;
     for val in 0..threads - 1 {
         expected += val;
-        loop {
-            let mut guard = lock.spin_lock();
-            if guard.is_none() {
-                guard.replace(val);
-                break;
-            }
-        }
+        let mut guard = lock.spin_lock_none();
+        guard.replace(val);
     }
     while done.load(Ordering::Relaxed) != expected {
         spin_loop_hint();
