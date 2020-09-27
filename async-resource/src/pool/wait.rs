@@ -22,17 +22,17 @@ pub struct WaitResponder<T> {
 
 impl<T> WaitResponder<T> {
     pub fn cancel(self) {
-        if let Ok(sender) = self.sender.try_take() {
+        if let Some(sender) = self.sender.try_take() {
             drop(sender);
         }
     }
 
     pub fn is_canceled(&self) -> bool {
-        !self.sender.status().can_take()
+        !self.sender.is_some_unlocked()
     }
 
     pub fn send(self, resolve: T) -> Result<(), T> {
-        if let Ok(sender) = self.sender.try_take() {
+        if let Some(sender) = self.sender.try_take() {
             sender.send(resolve)
         } else {
             Err(resolve)

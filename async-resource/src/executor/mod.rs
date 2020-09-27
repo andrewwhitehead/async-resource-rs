@@ -1,19 +1,19 @@
 use futures_lite::future::Boxed as BoxFuture;
 
-#[cfg(feature = "bounded-exec")]
-mod bounded;
+#[cfg(feature = "global-exec")]
+mod global;
 
-#[cfg(feature = "bounded-exec")]
-pub use self::bounded::BoundedExecutor;
+#[cfg(feature = "global-exec")]
+pub use self::global::GlobalExecutor;
 
-#[cfg(feature = "bounded-exec")]
+#[cfg(feature = "global-exec")]
 /// Returns a default [`Executor`] instance to use when constructing a resource
 /// pool.
 pub fn default_executor() -> Result<Box<dyn Executor>, crate::pool::ConfigError> {
-    Ok(Box::new(self::bounded::BoundedExecutor::global()))
+    Ok(Box::new(self::global::GlobalExecutor))
 }
 
-#[cfg(not(any(feature = "bounded-exec")))]
+#[cfg(not(any(feature = "global-exec")))]
 /// Returns a default [`Executor`] instance to use when constructing a resource
 /// pool.
 pub fn default_executor() -> Result<Box<dyn Executor>, ConfigError> {
@@ -24,5 +24,5 @@ pub fn default_executor() -> Result<Box<dyn Executor>, ConfigError> {
 /// resource pool.
 pub trait Executor: Send + Sync {
     /// Spawn a static, boxed Future with no return value
-    fn spawn_ok(&self, task: BoxFuture<()>);
+    fn spawn_obj(&self, task: BoxFuture<()>);
 }

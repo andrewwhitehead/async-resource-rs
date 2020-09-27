@@ -15,16 +15,14 @@ path = "src/lib.rs"
 
 [features]
 default = ["default-exec"]
-default-exec = ["bounded-exec"]
-bounded-exec = ["async-executor", "event-listener", "num_cpus"]
+default-exec = ["global-exec"]
+global-exec = ["async-global-executor"]
 
 [dependencies]
-async-executor = { version = "1.0", optional = true }
+async-global-executor = { version = "1.2", optional = true }
 concurrent-queue = "1.1"
-event-listener = { version = "2.4", optional = true }
 futures-lite = "1.4"
-num_cpus = { version = "1.13", optional = true }
-option-lock = { version = "0.1", path = "../option-lock" }
+option-lock = { version = "0.2", path = "../option-lock" }
 suspend = { version = "0.1.4", path = "../suspend" }
 
 [dev-dependencies]

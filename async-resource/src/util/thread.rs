@@ -30,7 +30,7 @@ struct State<T> {
 impl<T> State<T> {
     const fn new() -> Self {
         Self {
-            next: OptionLock::new(),
+            next: OptionLock::empty(),
             running: AtomicBool::new(true),
         }
     }
@@ -85,17 +85,17 @@ impl<T> ThreadResource<T> {
             loop {
                 let listen = suspend.listen();
                 match state.next.try_take() {
-                    Ok(Command::Run(f)) => {
+                    Some(Command::Run(f)) => {
                         f(&mut res);
                     }
-                    Ok(Command::Extract(f)) => {
+                    Some(Command::Extract(f)) => {
                         f(res);
                         break;
                     }
-                    Ok(Command::Stop) => {
+                    Some(Command::Stop) => {
                         break;
                     }
-                    Err(_) => {
+                    None => {
                         listen.wait();
                     }
                 }

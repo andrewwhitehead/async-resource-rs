@@ -309,7 +309,7 @@ impl<T: Send, E> PoolInternal<T, E> {
     pub fn complete_resolve(self: &Arc<Self>, res: ResourceResolve<T, E>) {
         if res.is_pending() {
             let inner = self.clone();
-            self.manage.executor.spawn_ok(
+            self.manage.executor.spawn_obj(
                 async move {
                     match res.await {
                         Some(Ok(res)) => {
