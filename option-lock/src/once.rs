@@ -1,16 +1,16 @@
 use super::lock::OptionLock;
 use core::fmt::{self, Debug, Display, Formatter};
 
-/// An Option value which can be safely written once.
+/// An `Option` value which can be safely written once.
 pub struct OnceCell<T>(OptionLock<T>);
 
 impl<T> OnceCell<T> {
-    /// Create a new, empty OnceCell.
+    /// Create a new, empty `OnceCell`.
     pub const fn empty() -> Self {
         Self(OptionLock::empty())
     }
 
-    /// Create a OnceCell from an owned value.
+    /// Create a `OnceCell` from an owned value.
     pub const fn new(value: T) -> Self {
         Self(OptionLock::new(value))
     }

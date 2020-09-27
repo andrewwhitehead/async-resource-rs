@@ -8,7 +8,7 @@ const SOME: u8 = 0x1;
 const FREE: u8 = 0x2;
 const AVAILABLE: u8 = FREE | SOME;
 
-/// A read/write lock around an Option value.
+/// A read/write lock around an `Option` value.
 pub struct OptionLock<T> {
     data: UnsafeCell<MaybeUninit<T>>,
     state: AtomicU8,
@@ -274,6 +274,7 @@ pub struct OptionGuard<'a, T> {
 }
 
 impl<T> OptionGuard<'_, T> {
+    /// Obtain a shared reference to the contained value, if any.
     pub fn as_ref(&self) -> Option<&T> {
         if self.filled {
             Some(unsafe { &*self.lock.as_mut_ptr() })
@@ -282,6 +283,7 @@ impl<T> OptionGuard<'_, T> {
         }
     }
 
+    /// Obtain an exclusive reference to the contained value, if any.
     pub fn as_mut_ref(&mut self) -> Option<&mut T> {
         if self.filled {
             Some(unsafe { &mut *self.lock.as_mut_ptr() })
@@ -290,11 +292,13 @@ impl<T> OptionGuard<'_, T> {
         }
     }
 
+    /// Check if the lock contains `None`.
     #[inline]
     pub fn is_none(&self) -> bool {
         !self.filled
     }
 
+    /// Check if the lock contains `Some(T)`.
     #[inline]
     pub fn is_some(&self) -> bool {
         self.filled
