@@ -1,9 +1,11 @@
 use std::cell::Cell;
-use std::ptr::{self, NonNull};
+use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread::{self, Thread};
 use std::time::Instant;
+
+use super::util::BoxPtr;
 
 const WAKE_STATE_IDLE: usize = 0b000;
 const WAKE_STATE_WOKEN: usize = 0b001;
@@ -81,7 +83,7 @@ where
     })
 }
 
-struct ThreadWakeHandle(NonNull<ThreadWake>, Cell<usize>);
+struct ThreadWakeHandle(BoxPtr<ThreadWake>, Cell<usize>);
 
 impl ThreadWakeHandle {
     pub fn new(thread: Thread) -> Self {
@@ -93,7 +95,7 @@ impl ThreadWakeHandle {
 
     #[cfg(test)]
     pub fn load_seqno(&self) -> usize {
-        unsafe { self.0.as_ref() }.seqno.load(Ordering::Relaxed)
+        self.0.seqno.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -111,7 +113,7 @@ impl ThreadWakeHandle {
 
 impl Drop for ThreadWakeHandle {
     fn drop(&mut self) {
-        ThreadWake::dec_count(self.0.as_ptr());
+        ThreadWake::dec_count(self.0);
     }
 }
 
@@ -123,13 +125,12 @@ pub(crate) struct ThreadWake {
 
 impl ThreadWake {
     #[inline]
-    pub fn new(thread: Thread, seqno: usize, count: usize) -> NonNull<Self> {
-        let slf = Box::into_raw(Box::new(Self {
+    pub fn new(thread: Thread, seqno: usize, count: usize) -> BoxPtr<Self> {
+        BoxPtr::new(Box::new(Self {
             thread,
             seqno: AtomicUsize::new(seqno),
             count: AtomicUsize::new(count),
-        }));
-        unsafe { NonNull::new_unchecked(slf) }
+        }))
     }
 
     #[inline]
@@ -166,25 +167,23 @@ impl ThreadWake {
     }
 
     #[inline]
-    pub fn inc_count(data: *mut Self) {
-        unsafe { &*data }.count.fetch_add(1, Ordering::Relaxed);
+    pub fn inc_count(data: BoxPtr<Self>) {
+        data.count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn dec_count(data: *mut Self) {
-        unsafe {
-            if (&*data).count.fetch_sub(1, Ordering::Release) == 1 {
-                // perform an acquire load to synchronize specifically with release
-                // writes to 'count' on other threads
-                (&*data).count.load(Ordering::Acquire);
-                Box::from_raw(data);
-            }
+    pub fn dec_count(data: BoxPtr<Self>) {
+        if data.count.fetch_sub(1, Ordering::Release) == 1 {
+            // perform an acquire load to synchronize specifically with release
+            // writes to 'count' on other threads
+            data.count.load(Ordering::Acquire);
+            drop(data.into_box())
         }
     }
 }
 
 pub(crate) struct ThreadWakeRef {
     seqno: usize,
-    ptr: NonNull<ThreadWake>,
+    ptr: BoxPtr<ThreadWake>,
     state: u8,
 }
 
@@ -197,7 +196,7 @@ impl ThreadWakeRef {
     );
 
     #[inline]
-    pub fn new(ptr: NonNull<ThreadWake>, seqno: usize) -> Self {
+    pub fn new(ptr: BoxPtr<ThreadWake>, seqno: usize) -> Self {
         Self {
             ptr,
             state: REF_STATE_IDLE,
@@ -217,7 +216,7 @@ impl ThreadWakeRef {
         self.state &= !REF_STATE_WOKEN;
         woken
             || if self.state & REF_STATE_ACQUIRED != 0 {
-                unsafe { self.ptr.as_ref() }.restart(self.seqno)
+                self.ptr.restart(self.seqno)
             } else {
                 false
             }
@@ -228,18 +227,18 @@ impl ThreadWakeRef {
         // it should not be possible to interact with the Waker simultaneously from
         // multiple threads, so we aren't using an atomic for the state
         if inst.state & REF_STATE_ACQUIRED == 0 {
-            if inst.ptr.as_ref().acquire(inst.seqno) {
+            if inst.ptr.acquire(inst.seqno) {
                 // acquired the thread local instance. increase the count to
                 // correspond with the waker we are creating
                 inst.state |= REF_STATE_ACQUIRED;
-                ThreadWake::inc_count(inst.ptr.as_ptr());
+                ThreadWake::inc_count(inst.ptr);
             } else {
                 inst.state |= REF_STATE_ACQUIRED | REF_STATE_CREATED;
                 // init with a count of 2, corresponding to this reference and the waker
-                inst.ptr = ThreadWake::new(inst.ptr.as_ref().thread.clone(), inst.seqno, 2);
+                inst.ptr = ThreadWake::new(inst.ptr.thread.clone(), inst.seqno, 2);
             }
         } else {
-            ThreadWake::inc_count(inst.ptr.as_ptr());
+            ThreadWake::inc_count(inst.ptr);
         }
         ThreadWakeClone::raw_waker(inst.ptr, inst.seqno)
     }
@@ -267,17 +266,17 @@ impl Drop for ThreadWakeRef {
     fn drop(&mut self) {
         if self.state & REF_STATE_CREATED != 0 {
             // reduce the count of the instance we created (re-entry use case)
-            ThreadWake::dec_count(self.ptr.as_ptr());
+            ThreadWake::dec_count(self.ptr);
         } else if self.state & REF_STATE_ACQUIRED != 0 {
             // the count for the thread local instance is not increased when it is acquired
-            unsafe { self.ptr.as_ref() }.release();
+            self.ptr.release();
         }
     }
 }
 
 pub(crate) struct ThreadWakeClone {
     seqno: usize,
-    ptr: NonNull<ThreadWake>,
+    ptr: BoxPtr<ThreadWake>,
 }
 
 impl ThreadWakeClone {
@@ -289,31 +288,31 @@ impl ThreadWakeClone {
     );
 
     #[inline]
-    pub fn raw_waker(ptr: NonNull<ThreadWake>, seqno: usize) -> RawWaker {
+    pub fn raw_waker(ptr: BoxPtr<ThreadWake>, seqno: usize) -> RawWaker {
         let data = Box::into_raw(Box::new(Self { ptr, seqno }));
         RawWaker::new(data as *const (), &Self::WAKER_VTABLE)
     }
 
     unsafe fn clone_waker(data: *const ()) -> RawWaker {
         let inst = ptr::read(data as *const Self);
-        ThreadWake::inc_count(inst.ptr.as_ptr());
+        ThreadWake::inc_count(inst.ptr);
         Self::raw_waker(inst.ptr, inst.seqno)
     }
 
     unsafe fn wake_waker(data: *const ()) {
         let inst = Box::from_raw(data as *mut Self);
-        inst.ptr.as_ref().unpark(inst.seqno);
-        ThreadWake::dec_count(inst.ptr.as_ptr());
+        inst.ptr.unpark(inst.seqno);
+        ThreadWake::dec_count(inst.ptr);
     }
 
     unsafe fn wake_by_ref_waker(data: *const ()) {
         let inst = ptr::read(data as *const Self);
-        inst.ptr.as_ref().unpark(inst.seqno);
+        inst.ptr.unpark(inst.seqno);
     }
 
     unsafe fn drop_waker(data: *const ()) {
         let inst = Box::from_raw(data as *mut Self);
-        ThreadWake::dec_count(inst.ptr.as_ptr());
+        ThreadWake::dec_count(inst.ptr);
     }
 }
 

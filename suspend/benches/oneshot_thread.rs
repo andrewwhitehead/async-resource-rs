@@ -4,12 +4,12 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use futures_channel::oneshot as futures_oneshot;
 use oneshot_rs as oneshot;
-use suspend::{block_on, message_task};
+use suspend::{block_on, send_once};
 
-fn message_telephone(threads: usize) {
-    let (sender, mut receiver) = message_task();
+fn channel_telephone(threads: usize) {
+    let (sender, mut receiver) = send_once();
     for _ in 0..threads {
-        let (next_send, next_receive) = message_task();
+        let (next_send, next_receive) = send_once();
         thread::spawn(move || {
             let result = receiver.wait().unwrap_or(0);
             next_send.send(result).unwrap();
@@ -57,7 +57,7 @@ fn bench_telephone(c: &mut Criterion) {
         BenchmarkId::new("message-telephone", count),
         &count,
         |b, &s| {
-            b.iter(|| message_telephone(s));
+            b.iter(|| channel_telephone(s));
         },
     );
     c.bench_with_input(

@@ -1,239 +1,72 @@
-use std::fmt::{self, Debug, Formatter};
-use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
 
-use futures_core::stream::{BoxStream, FusedStream, Stream};
+use futures_core::stream::Stream;
+use futures_lite::stream::{poll_fn as stream_poll_fn, PollFn};
 
-use super::helpers::{block_on, block_on_deadline};
-use super::TimedOut;
-
-pub type BoxFusedStream<'t, T> = Pin<Box<dyn FusedStream<Item = T> + Send + 't>>;
+use super::thread::thread_suspend;
 
 /// A convenience method to turn a `Stream` into an `Iterator` which parks the
 /// current thread until items are available.
-pub fn iter_stream<S>(stream: S) -> Iter<'static, S::Item>
+pub fn iter_stream<S>(stream: S) -> IterStream<Pin<Box<S>>>
 where
-    S: Stream + Send + 'static,
+    S: Stream,
 {
-    Iter::from_stream(stream)
+    IterStream(Some(Box::pin(stream)))
 }
 
-/// A polling function equivalent to `Stream::poll_next`.
-pub type PollNextFn<'a, T> = Box<dyn FnMut(&mut Context) -> Poll<Option<T>> + Send + 'a>;
-
-enum IterState<'s, T> {
-    FusedStream(BoxFusedStream<'s, T>),
-    Stream(BoxStream<'s, T>),
-    PollNext(PollNextFn<'s, T>),
+/// A convenience method to turn a `Stream` into an `Iterator` which parks the
+/// current thread until items are available.
+pub fn iter_stream_unpin<S>(stream: S) -> IterStream<S>
+where
+    S: Stream + Unpin,
+{
+    IterStream(Some(stream))
 }
 
-impl<'s, T> IterState<'s, T> {
-    fn is_terminated(&self) -> bool {
-        match self {
-            IterState::FusedStream(stream) => stream.is_terminated(),
-            _ => false,
-        }
-    }
-
-    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        match self {
-            IterState::FusedStream(stream) => stream.as_mut().poll_next(cx),
-            IterState::Stream(stream) => stream.as_mut().poll_next(cx),
-            IterState::PollNext(poll_next) => poll_next(cx),
-        }
-    }
+/// A convenience method to turn a `Stream` into an `Iterator` which parks the
+/// current thread until items are available.
+pub fn iter_poll_fn<T, F>(poll_fn: F) -> IterStream<PollFn<F>>
+where
+    F: FnMut(&mut Context) -> Poll<Option<T>>,
+{
+    IterStream(Some(stream_poll_fn(poll_fn)))
 }
 
-/// A stream which may be polled asynchronously, or by using blocking
-/// operations with an optional timeout.
-#[must_use = "Iter must be awaited"]
-pub struct Iter<'s, T> {
-    state: IterState<'s, T>,
-}
+pub struct IterStream<S>(Option<S>);
 
-impl<T> Iter<'static, T> {
-    /// Create a new `Iter` from a function returning `Poll<Option<T>>`. If
-    /// the function is already boxed, then it would be more efficent to use
-    /// `Iter::from`.
-    pub fn from_poll_next<F>(f: F) -> Self
-    where
-        F: FnMut(&mut Context) -> Poll<Option<T>> + Send + 'static,
-    {
-        Self::from(Box::new(f) as PollNextFn<'static, T>)
-    }
-
-    /// Create a new `Iter` from a `Stream<T>`. If the stream is already boxed,
-    /// then it would be more efficent to use `Iter::from`.
-    pub fn from_iter<I>(iter: I) -> Self
-    where
-        I: IntoIterator<Item = T> + 'static,
-        <I as IntoIterator>::IntoIter: Send,
-    {
-        let mut iter = iter.into_iter();
-        Self::from_poll_next(move |_cx| Poll::Ready(iter.next()))
-    }
-
-    /// Create a new `Iter` from a `FusedStream<T>`. If the stream is already boxed,
-    /// then it would be more efficent to use `Iter::from`.
-    pub fn from_fused_stream<S>(s: S) -> Self
-    where
-        S: FusedStream<Item = T> + Send + 'static,
-    {
-        Self::from(Box::pin(s) as BoxFusedStream<'static, T>)
-    }
-
-    /// Create a new `Iter` from a `Stream<T>`. If the stream is already boxed,
-    /// then it would be more efficent to use `Iter::from`.
-    pub fn from_stream<S>(s: S) -> Self
-    where
-        S: Stream<Item = T> + Send + 'static,
-    {
-        Self::from(Box::pin(s) as BoxStream<'static, T>)
-    }
-
-    /// Map the items of the `Iter` using a transformation function.
-    pub fn map<F, R>(self, f: F) -> Iter<'static, R>
-    where
-        F: Fn(T) -> R + Send + 'static,
-        T: 'static,
-    {
-        let mut state = self.state;
-        Iter::from_poll_next(move |cx| state.poll_next(cx).map(|opt| opt.map(&f)))
+impl<S> IterStream<S> {
+    pub fn into_inner(self) -> Option<S> {
+        self.0
     }
 }
 
-impl<'s, T> Iter<'s, T> {
-    /// If the `Iter` is wrapping a `FusedStream`, then this method will return
-    /// `true` when the stream should no longer be polled.
-    pub fn is_terminated(&self) -> bool {
-        self.state.is_terminated()
-    }
-
-    /// Create a new future which resolves to the next item in the stream.
-    pub fn next(&mut self) -> Next<'_, 's, T> {
-        Next { iter: self }
-    }
-
-    /// Resolve the next item in the `Iter` stream, parking the current thread
-    /// until the result is available.
-    pub fn wait_next(&mut self) -> Option<T> {
-        block_on(self.next())
-    }
-
-    /// Resolve the next item in the `Iter` stream, parking the current thread
-    /// until the result is available or the deadline is reached. If a timeout
-    /// occurs then `Err(TimedOut)` is returned.
-    pub fn wait_next_deadline(&mut self, expire: Instant) -> Result<Option<T>, TimedOut> {
-        block_on_deadline(self.next(), expire).map_err(|_| TimedOut)
-    }
-
-    /// Resolve the next item in the `Iter` stream, parking the current thread
-    /// until the result is available or the timeout expires. If a timeout does
-    /// occur then `Err(TimedOut)` is returned.
-    pub fn wait_next_timeout(&mut self, timeout: Duration) -> Result<Option<T>, TimedOut> {
-        match Instant::now().checked_add(timeout) {
-            Some(expire) => self.wait_next_deadline(expire),
-            None => Err(TimedOut),
-        }
-    }
-}
-
-impl<T, E> Iter<'static, Result<T, E>> {
-    /// A helper method to map the `Ok(T)` item of the `Iter<Result<T, E>>`
-    /// using a transformation function.
-    pub fn map_ok<F, R>(self, f: F) -> Iter<'static, Result<R, E>>
-    where
-        F: Fn(T) -> R + Send + 'static,
-        T: 'static,
-        E: 'static,
-    {
-        self.map(move |r| r.map(&f))
-    }
-
-    /// A helper method to map the `Err(E)` item of the `Iter<Result<T, E>>`
-    /// using a transformation function.
-    pub fn map_err<F, R>(self, f: F) -> Iter<'static, Result<T, R>>
-    where
-        F: Fn(E) -> R + Send + 'static,
-        T: 'static,
-        E: 'static,
-    {
-        self.map(move |r| r.map_err(&f))
-    }
-}
-
-impl<'s, T> From<BoxStream<'s, T>> for Iter<'s, T> {
-    fn from(stream: BoxStream<'s, T>) -> Self {
-        Self {
-            state: IterState::Stream(stream),
-        }
-    }
-}
-
-impl<'s, T> From<BoxFusedStream<'s, T>> for Iter<'s, T> {
-    fn from(stream: BoxFusedStream<'s, T>) -> Self {
-        Self {
-            state: IterState::FusedStream(stream),
-        }
-    }
-}
-
-impl<'s, T> From<PollNextFn<'s, T>> for Iter<'s, T> {
-    fn from(poll: PollNextFn<'s, T>) -> Self {
-        Self {
-            state: IterState::PollNext(poll),
-        }
-    }
-}
-
-impl<T> Debug for Iter<'_, T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "Iter({:p})", self)
-    }
-}
-
-impl<'s, T> Iterator for Iter<'s, T> {
-    type Item = T;
+impl<S> Iterator for IterStream<S>
+where
+    S: Stream + Unpin,
+{
+    type Item = S::Item;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.wait_next()
+        if let Some(mut stream) = self.0.as_mut() {
+            thread_suspend(|cx| Pin::new(&mut stream).poll_next(cx))
+        } else {
+            None
+        }
     }
 }
 
-impl<T> PartialEq for Iter<'_, T> {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self, other)
-    }
-}
-
-impl<T> Eq for Iter<'_, T> {}
-
-impl<'s, T> FusedStream for Iter<'s, T> {
-    fn is_terminated(&self) -> bool {
-        self.is_terminated()
-    }
-}
-
-impl<'s, T> Stream for Iter<'s, T> {
-    type Item = T;
+impl<S> Stream for IterStream<S>
+where
+    S: Stream + Unpin,
+{
+    type Item = S::Item;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.state.poll_next(cx)
-    }
-}
-
-/// A `Future` representing the next item in an [`Iter`] stream.
-#[derive(Debug)]
-pub struct Next<'n, 's, T> {
-    iter: &'n mut Iter<'s, T>,
-}
-
-impl<'n, 's, T> Future for Next<'n, 's, T> {
-    type Output = Option<T>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.iter.state.poll_next(cx)
+        if let Some(mut stream) = self.0.as_mut() {
+            Pin::new(&mut stream).poll_next(cx)
+        } else {
+            Poll::Ready(None)
+        }
     }
 }

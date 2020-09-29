@@ -36,11 +36,11 @@ fn suspend_block_on_boxed(count: usize) {
     }
 }
 
-fn suspend_wait_task(count: usize) {
-    for _ in 0..count {
-        suspend::Task::from_fut(test_fut()).wait();
-    }
-}
+// fn suspend_wait_task(count: usize) {
+//     for _ in 0..count {
+//         suspend::Task::from_fut(test_fut()).wait();
+//     }
+// }
 
 fn futures_block_on(count: usize) {
     for _ in 0..count {
@@ -64,13 +64,13 @@ fn bench_block_on(c: &mut Criterion) {
             b.iter(|| suspend_block_on_boxed(s));
         },
     );
-    c.bench_with_input(
-        BenchmarkId::new("suspend-wait-task", count),
-        &count,
-        |b, &s| {
-            b.iter(|| suspend_wait_task(s));
-        },
-    );
+    // c.bench_with_input(
+    //     BenchmarkId::new("suspend-wait-task", count),
+    //     &count,
+    //     |b, &s| {
+    //         b.iter(|| suspend_wait_task(s));
+    //     },
+    // );
     c.bench_with_input(
         BenchmarkId::new("futures-block_on", count),
         &count,

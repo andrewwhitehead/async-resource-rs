@@ -2,12 +2,12 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use futures_channel::oneshot as futures_oneshot;
 use oneshot_rs as oneshot;
-use suspend::{block_on, message_task, Suspend};
+use suspend::{block_on, send_once, Suspend};
 
-fn message_many(count: usize, drop_recv: bool) {
+fn channel_many(count: usize, drop_recv: bool) {
     let mut sus = Suspend::new();
     for _ in 0..count {
-        let (sender, mut receiver) = message_task();
+        let (sender, mut receiver) = send_once();
         sus.poll_future_unpin(&mut receiver).unwrap_err();
         if drop_recv {
             drop(receiver);
@@ -52,7 +52,7 @@ fn oneshot_many(count: usize, drop_recv: bool) {
 fn bench_many(c: &mut Criterion) {
     let count = 5000;
     c.bench_with_input(BenchmarkId::new("message-many", count), &count, |b, &s| {
-        b.iter(|| message_many(s, false));
+        b.iter(|| channel_many(s, false));
     });
     c.bench_with_input(BenchmarkId::new("futures-many", count), &count, |b, &s| {
         b.iter(|| futures_many(s, false));
@@ -68,7 +68,7 @@ fn bench_many_drop_recv(c: &mut Criterion) {
         BenchmarkId::new("message-many-drop", count),
         &count,
         |b, &s| {
-            b.iter(|| message_many(s, true));
+            b.iter(|| channel_many(s, true));
         },
     );
     c.bench_with_input(

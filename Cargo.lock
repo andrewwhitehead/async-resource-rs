@@ -742,6 +742,7 @@ dependencies = [
  "futures-lite",
  "futures-task",
  "oneshot",
+ "option-lock",
 ]
 
 [[package]]

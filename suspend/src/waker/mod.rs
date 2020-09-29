@@ -9,6 +9,10 @@ pub(crate) mod internal;
 
 pub use internal::{waker_ref, ArcWake, IntoWaker, WakeByRef, Wakeable, WakerRef};
 
+pub(crate) mod null;
+
+pub use null::NullWaker;
+
 thread_local! {
     pub(crate) static THREAD_WAKER: Waker = thread_waker();
 }

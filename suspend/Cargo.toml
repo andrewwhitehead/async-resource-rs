@@ -21,6 +21,7 @@ default = []
 futures-core = "0.3"
 futures-lite = "1.4"
 futures-task = "0.3"
+option-lock = { version = "0.2", path = "../option-lock" }
 
 [dev-dependencies]
 criterion = "0.3"

@@ -1,7 +1,5 @@
 use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::ptr::NonNull;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -10,6 +8,8 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 
 use futures_task::waker;
 pub use futures_task::{waker_ref, ArcWake, WakerRef};
+
+use crate::util::{BoxPtr, Maybe};
 
 /// A generic trait for types that can be woken by reference.
 pub trait WakeByRef: Send + Sync {
@@ -70,7 +70,7 @@ impl IntoWaker for &Waker {
 
 pub(crate) struct WakeableState<T: WakeByRef> {
     value: UnsafeCell<T>,
-    waker: MaybeUninit<Waker>,
+    waker: Maybe<Waker>,
     count: AtomicUsize,
 }
 
@@ -83,31 +83,34 @@ impl<T: WakeByRef> WakeableState<T> {
     );
 
     #[inline]
-    fn new_raw(value: T) -> *mut Self {
-        Box::into_raw(Box::new(Self {
+    fn new_raw(value: T) -> BoxPtr<Self> {
+        BoxPtr::new(Box::new(Self {
             value: UnsafeCell::new(value),
-            waker: MaybeUninit::uninit(),
+            waker: Maybe::empty(),
             count: AtomicUsize::new(1),
         }))
     }
 
-    pub fn new(value: T) -> NonNull<Self> {
+    #[inline]
+    pub fn new(value: T) -> BoxPtr<Self> {
         unsafe {
-            let slf = Self::new_raw(value);
-            (&mut *slf).waker = MaybeUninit::new(Waker::from_raw(Self::raw_waker(slf)));
-            NonNull::new_unchecked(slf)
-        }
-    }
-
-    pub fn new_waker(value: T) -> Waker {
-        unsafe {
-            let slf = Self::new_raw(value);
-            Waker::from_raw(Self::raw_waker(slf))
+            let mut slf = Self::new_raw(value);
+            let ptr = slf.as_ptr();
+            slf.waker.store(Waker::from_raw(Self::raw_waker(ptr)));
+            slf
         }
     }
 
     #[inline]
-    pub fn get(&self) -> &T {
+    pub fn new_waker(value: T) -> Waker {
+        unsafe {
+            let slf = Self::new_raw(value);
+            Waker::from_raw(Self::raw_waker(slf.as_ptr()))
+        }
+    }
+
+    #[inline]
+    pub fn as_ref(&self) -> &T {
         unsafe { &*self.value.get() }
     }
 
@@ -151,13 +154,13 @@ impl<T: WakeByRef> WakeableState<T> {
 
     unsafe fn wake_waker(data: *const ()) {
         let inst = &mut *(data as *mut Self);
-        inst.get().wake_by_ref();
+        inst.as_ref().wake_by_ref();
         Self::dec_count(inst);
     }
 
     unsafe fn wake_by_ref_waker(data: *const ()) {
         let inst = &*(data as *const Self);
-        inst.get().wake_by_ref();
+        inst.as_ref().wake_by_ref();
     }
 
     unsafe fn drop_waker(data: *const ()) {
@@ -166,7 +169,7 @@ impl<T: WakeByRef> WakeableState<T> {
 }
 
 pub struct Wakeable<T: WakeByRef> {
-    ptr: NonNull<WakeableState<T>>,
+    ptr: BoxPtr<WakeableState<T>>,
 }
 
 impl<T: WakeByRef> Wakeable<T> {
@@ -177,7 +180,7 @@ impl<T: WakeByRef> Wakeable<T> {
     }
 
     fn waker(&self) -> &Waker {
-        unsafe { self.ptr.as_ref() }.waker()
+        self.ptr.waker()
     }
 }
 
@@ -192,7 +195,7 @@ impl<T: WakeByRef> Deref for Wakeable<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { self.ptr.as_ref().get() }
+        self.ptr.as_ref()
     }
 }
 

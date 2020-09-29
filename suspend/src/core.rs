@@ -1,14 +1,14 @@
 use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
-use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::pin::Pin;
-use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use super::notify::{Listener, Notifier};
 use super::thread::thread_suspend_deadline;
+use super::util::{BoxPtr, Maybe};
 use super::waker::{internal::WakeableState, WakeByRef};
 
 const STATE_IDLE: u8 = 0b000;
@@ -24,15 +24,18 @@ macro_rules! acquire {
 
 pub(crate) struct SuspendState {
     state: AtomicU8,
-    waker: MaybeUninit<Waker>,
+    waker: Maybe<Waker>,
 }
+
+unsafe impl Send for SuspendState {}
+unsafe impl Sync for SuspendState {}
 
 impl SuspendState {
     #[inline]
     const fn new(state: u8) -> Self {
         Self {
             state: AtomicU8::new(state),
-            waker: MaybeUninit::uninit(),
+            waker: Maybe::empty(),
         }
     }
 
@@ -64,7 +67,7 @@ impl SuspendState {
             STATE_WAIT => true,
             STATE_LISTEN => {
                 acquire!(self.state);
-                unsafe { self.drop_waker() };
+                self.waker.clear();
                 true
             }
             _ => panic!("Invalid state"),
@@ -93,7 +96,7 @@ impl SuspendState {
                 ) {
                     Ok(_) => {
                         acquire!(self.state);
-                        unsafe { self.drop_waker() };
+                        self.waker.clear();
                     }
                     Err(STATE_WAIT) => {
                         // competition from another thread?
@@ -113,9 +116,7 @@ impl SuspendState {
 
         // must be in the WAIT state at this point, or LOCKED_WAIT if pre-empted
         // by lock()
-        unsafe {
-            self.store_waker(cx.waker().clone());
-        }
+        self.waker.store(cx.waker().clone());
 
         match self.state.compare_exchange(
             STATE_WAIT,
@@ -130,7 +131,7 @@ impl SuspendState {
             Err(STATE_IDLE) => {
                 // notify() was called while storing
                 acquire!(self.state);
-                unsafe { self.drop_waker() };
+                self.waker.clear();
                 Poll::Ready(())
             }
             _ => panic!("Invalid state"),
@@ -138,36 +139,34 @@ impl SuspendState {
     }
 
     /// Clear the state if it is waiting, and call the notifier if any.
-    /// Returns true if there was an active listener.
     pub fn notify(&self) {
         match self.state.swap(STATE_IDLE, Ordering::Release) & STATE_LISTEN {
             STATE_IDLE | STATE_WAIT => (),
             STATE_LISTEN => {
                 acquire!(self.state);
-                unsafe { self.wake_waker() };
+                self.waker.load().wake();
             }
             _ => panic!("Invalid state"),
         }
     }
 
     #[inline]
+    pub fn is_waiting(&self) -> bool {
+        self.state.load(Ordering::Relaxed) != STATE_IDLE
+    }
+
+    #[inline]
     pub fn state(&self) -> u8 {
-        self.state.load(Ordering::SeqCst)
+        self.state.load(Ordering::Relaxed)
     }
 
-    #[inline]
-    unsafe fn drop_waker(&mut self) {
-        ptr::drop_in_place(self.waker.as_mut_ptr());
-    }
-
-    #[inline]
-    unsafe fn store_waker(&mut self, waker: Waker) {
-        self.waker.as_mut_ptr().write(waker)
-    }
-
-    #[inline]
-    unsafe fn wake_waker(&self) {
-        ptr::read(&self.waker).assume_init().wake();
+    pub fn state_str(&self) -> &'static str {
+        match self.state() {
+            STATE_IDLE => "Notified",
+            STATE_WAIT => "Waiting",
+            STATE_LISTEN => "Polled",
+            _ => "<!>",
+        }
     }
 
     pub fn wait(&mut self) {
@@ -217,7 +216,7 @@ impl WakeByRef for SuspendState {
 }
 
 pub(crate) struct SharedSuspend {
-    ptr: NonNull<WakeableState<SuspendState>>,
+    ptr: BoxPtr<WakeableState<SuspendState>>,
 }
 
 unsafe impl Send for SharedSuspend {}
@@ -238,7 +237,7 @@ impl SharedSuspend {
 
     #[inline]
     fn inner(&self) -> &WakeableState<SuspendState> {
-        unsafe { self.ptr.as_ref() }
+        &*self.ptr
     }
 
     pub unsafe fn acquire_unchecked(&self) -> &mut SuspendState {
@@ -246,7 +245,7 @@ impl SharedSuspend {
     }
 
     pub fn try_acquire(&self) -> Option<&mut SuspendState> {
-        if self.inner().get().try_acquire() {
+        if self.inner().as_ref().try_acquire() {
             Some(unsafe { self.acquire_unchecked() })
         } else {
             None
@@ -269,13 +268,13 @@ impl Deref for SharedSuspend {
     type Target = SuspendState;
 
     fn deref(&self) -> &Self::Target {
-        self.inner().get()
+        self.inner().as_ref()
     }
 }
 
 impl Drop for SharedSuspend {
     fn drop(&mut self) {
-        WakeableState::dec_count(unsafe { self.ptr.as_mut() });
+        WakeableState::dec_count(self.ptr.as_ptr());
     }
 }
 
@@ -297,9 +296,7 @@ impl Suspend {
 
     /// Construct a new `Notifier` instance associated with this `Suspend`.
     pub fn notifier(&self) -> Notifier {
-        Notifier {
-            shared: self.shared.clone(),
-        }
+        Notifier::from(self.shared.clone())
     }
 
     /// Directly notify the `Suspend` instance and call any
@@ -433,132 +430,5 @@ impl Debug for Suspend {
 impl Default for Suspend {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// The result of acquiring a [`Suspend`] using either [`Suspend::listen`] or
-/// [`Suspend::try_listen`]. It may be used to wait for a notification with
-/// `.await` or by parking the current thread.
-pub struct Listener<'a> {
-    shared: &'a mut SuspendState,
-    waker: &'a Waker,
-}
-
-impl Listener<'_> {
-    /// Check if the listener has already been notified.
-    pub fn is_notified(&self) -> bool {
-        self.shared.check_idle()
-    }
-
-    /// Poll a `Future`, which will then notify this listener when ready.
-    pub fn poll_future<F>(&mut self, fut: Pin<&mut F>) -> Poll<F::Output>
-    where
-        F: Future,
-    {
-        let mut cx = Context::from_waker(self.waker);
-        fut.poll(&mut cx)
-    }
-
-    /// A convenience method to poll a `Future + Unpin`.
-    pub fn poll_future_unpin<F>(&mut self, fut: &mut F) -> Poll<F::Output>
-    where
-        F: Future + Unpin,
-    {
-        self.poll_future(Pin::new(fut))
-    }
-
-    /// Wait for a notification on the associated `Suspend` instance, parking
-    /// the current thread until that time.
-    pub fn wait(self) {
-        self.shared.wait()
-    }
-
-    /// Wait for a notification on the associated `Suspend` instance, parking
-    /// the current thread until the result is available or the deadline is
-    /// reached. If a timeout occurs then `false` is returned, otherwise
-    /// `true`.
-    pub fn wait_deadline(self, expire: Instant) -> Result<(), Self> {
-        if self.shared.wait_deadline(Some(expire)) {
-            Ok(())
-        } else {
-            Err(self)
-        }
-    }
-
-    /// Wait for a notification on the associated `Suspend` instance, parking
-    /// the current thread until the result is available or the timeout
-    /// expires. If a timeout does occur then `false` is returned, otherwise
-    /// `true`.
-    pub fn wait_timeout(self, timeout: Duration) -> Result<(), Self> {
-        if self.shared.wait_timeout(timeout) {
-            Ok(())
-        } else {
-            Err(self)
-        }
-    }
-}
-
-impl Debug for Listener<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let state = match self.shared.state() {
-            STATE_IDLE => "Notified",
-            STATE_WAIT => "Waiting",
-            STATE_LISTEN => "Polled",
-            _ => "<!>",
-        };
-        write!(f, "Listener({})", state)
-    }
-}
-
-impl Drop for Listener<'_> {
-    fn drop(&mut self) {
-        self.shared.clear_waiting();
-    }
-}
-
-impl Future for Listener<'_> {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.shared.poll(cx)
-    }
-}
-
-impl PartialEq for Listener<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self, other)
-    }
-}
-
-impl Eq for Listener<'_> {}
-
-/// An instance of a notifier for a [`Suspend`] instance. When notified, the
-/// associated thread or `Future` will be woken if currently suspended.
-pub struct Notifier {
-    shared: SharedSuspend,
-}
-
-impl Notifier {
-    /// Notify the associated [`Suspend`] instance, calling its currently
-    /// associated waker, if any.
-    pub fn notify(&self) {
-        self.shared.notify();
-    }
-
-    /// Obtain a `Waker` corresponding to the associated [`Suspend`] instance.
-    pub fn waker(&self) -> &Waker {
-        self.shared.waker()
-    }
-}
-
-impl Clone for Notifier {
-    fn clone(&self) -> Self {
-        Self::from(self.shared.clone())
-    }
-}
-
-impl From<SharedSuspend> for Notifier {
-    fn from(shared: SharedSuspend) -> Self {
-        Self { shared }
     }
 }

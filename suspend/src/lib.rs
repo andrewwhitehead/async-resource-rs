@@ -17,26 +17,8 @@
 //!
 //! # Examples
 //!
-//! The [`Task`] structure allows a `Future` or a polling function to be
-//! evaluated in a blocking manner, as well as transform the result to produce
-//! a new Task:
-//!
-//! ```
-//! let task = suspend::Task::from_fut(async { 100 }).map(|val| val * 2);
-//! assert_eq!(task.wait(), 200);
-//! ```
-//!
-//! Similarly, the [`Iter`] structure allows a `Stream` instance to be consumed
-//! in an async or blocking manner:
-//!
-//! ```
-//! let mut values = suspend::Iter::from_iter(1..);
-//! assert_eq!(suspend::block_on(async { values.next().await }), Some(1));
-//! assert_eq!(values.take(3).collect::<Vec<_>>(), vec![2, 3, 4]);
-//! ```
-//!
 //! The [`Suspend`] structure may be used to coordinate between threads and
-//! `Futures`, allowing either to act as a waiter or notifier:
+//! `Futures`, allowing either to act as a listener or notifier:
 //!
 //! ```
 //! use std::time::Duration;
@@ -57,12 +39,16 @@
 //! suspend::block_on(async { listener.await });
 //! ```
 //!
-//! It can also be used to directly poll a `Future`:
+//! It can also be used to directly poll a `Future`. If the future does
+//! not return immediately, then the `Suspend` will be notified when
+//! the future is ready to be polled again:
 //!
 //! ```
+//! use futures_lite::pin;
 //! let mut susp = suspend::Suspend::new();
-//! let mut task = suspend::Task::from_fut(async { 99 });
-//! assert_eq!(susp.poll_future_unpin(&mut task), Ok(99));
+//! let mut task = async { 99 };
+//! pin!(task);
+//! assert_eq!(susp.poll_future(task), Ok(99));
 //! ```
 
 #[doc(hidden)]
@@ -74,30 +60,28 @@ pub mod async_stream;
 
 mod channel;
 
+pub use self::channel::{channel, send_once, ReceiveOnce, Receiver, SendOnce, Sender};
+
 mod core;
-pub use self::core::{Listener, Notifier, Suspend};
+pub use self::core::Suspend;
 
 mod error;
 pub use self::error::{Incomplete, TimedOut};
 
 /// Providing a convenient wrapper around `Stream` types.
-pub mod iter;
-#[doc(hidden)]
-pub use self::iter::{iter_stream, Iter};
+mod iter;
+pub use self::iter::{iter_poll_fn, iter_stream, iter_stream_unpin, IterStream};
 
 mod helpers;
 pub use self::helpers::{block_on, block_on_deadline};
 
-/// Support for creating pollable [`Task`] instances, implementing `Future`
-/// and having additional flexibility.
-pub mod task;
-#[doc(hidden)]
-pub use self::task::{message_task, notify_once, ready};
+mod notify;
 
-#[doc(hidden)]
-pub use self::task::{Task, TaskSender};
+pub use self::notify::{notify_once, ListenOnce, Listener, Notifier, NotifyOnce};
 
 pub mod thread;
+
+mod util;
 
 /// Utilities for creating [`Waker`](waker::Waker) instances.
 #[macro_use]
