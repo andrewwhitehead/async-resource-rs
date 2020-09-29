@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures_core::stream::Stream;
+use futures_core::stream::{FusedStream, Stream};
 use futures_lite::stream::{poll_fn as stream_poll_fn, PollFn};
 
 use super::thread::thread_suspend;
@@ -68,5 +68,17 @@ where
         } else {
             Poll::Ready(None)
         }
+    }
+}
+
+impl<S> FusedStream for IterStream<S>
+where
+    S: FusedStream + Unpin,
+{
+    fn is_terminated(&self) -> bool {
+        self.0
+            .as_ref()
+            .map(FusedStream::is_terminated)
+            .unwrap_or(true)
     }
 }
